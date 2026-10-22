@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>DHT Algorithm Lab</title><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+    <header>
+        <h1>DHT Algorithm Lab</h1>
+        <p>Интерактивная лаборатория распределённых алгоритмов</p>
+    </header>
+
+    <main>
+
+        <!-- Настройка сети -->
+        <section id="network-section">
+            <h2>Сеть узлов</h2>
+
+            <label for="node-ids">ID узлов:</label>
+            <input
+                type="text"
+                id="node-ids"
+                value="4, 8, 14, 21, 32, 38, 42, 48, 51, 56"
+            >
+
+            <button id="create-network" type="button">
+                Создать сеть
+            </button>
+
+            <button id="random-network" type="button">
+                Случайная сеть
+            </button>
+
+            <svg
+                id="network-svg"
+                viewBox="0 0 800 450"
+                role="img"
+                aria-label="Визуализация сети DHT"
+            >
+                <text x="400" y="225" text-anchor="middle">
+                    Здесь будет визуализация сети
+                </text>
+            </svg>
+        </section>
+
+        <!-- Параметры поиска -->
+        <section id="search-section">
+            <h2>Параметры поиска</h2>
+
+            <label for="algorithm">Алгоритм:</label>
+            <select id="algorithm">
+                <option value="chord">Chord</option>
+                <option value="kademlia">Kademlia</option>
+            </select>
+
+            <label for="start-node">Начальный узел:</label>
+            <input
+                type="number"
+                id="start-node"
+                min="0"
+                max="63"
+                value="8"
+            >
+
+            <label for="target-id">Целевой ID:</label>
+            <input
+                type="number"
+                id="target-id"
+                min="0"
+                max="63"
+                value="54"
+            >
+
+            <div id="simulation-controls">
+                <button id="start-btn" type="button">Начать</button>
+                <button id="prev-btn" type="button" disabled>Назад</button>
+                <button id="next-btn" type="button" disabled>Следующий шаг</button>
+                <button id="reset-btn" type="button">Сброс</button>
+            </div>
+        </section>
+
+        <!-- Таблицы маршрутизации -->
+        <section id="routing-section">
+            <h2>Таблица маршрутизации</h2>
+
+            <div id="routing-table">
+                <p>
+                    Здесь будет Finger Table для Chord
+                    или k-buckets для Kademlia.
+                </p>
+            </div>
+        </section>
+
+        <!-- Пошаговое выполнение -->
+        <section id="steps-section">
+            <h2>Ход выполнения</h2>
+
+            <p id="step-description" aria-live="polite">
+                Запустите симуляцию, чтобы увидеть шаги алгоритма.
+            </p>
+
+            <ol id="steps-list"></ol>
+        </section>
+
+        <!-- Метрики -->
+        <section id="metrics-section">
+            <h2>Результаты</h2>
+
+            <p>Переходы: <span id="hops-count">0</span></p>
+            <p>Запросы: <span id="requests-count">0</span></p>
+            <p>Раунды: <span id="rounds-count">0</span></p>
+
+            <p id="search-result" aria-live="polite">
+                Поиск ещё не выполнялся.
+            </p>
+        </section>
+
+    </main>
+<script src="/app.js" defer></script>
+</body>
+</html>

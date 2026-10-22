@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	const addr = "127.0.0.1:8080"
+	const addr = ":8080"
 
 	server := &http.Server{
 		Addr:              addr,
