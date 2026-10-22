@@ -1,6 +1,9 @@
 package network
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 const (
 	MinBits = 1
@@ -12,8 +15,8 @@ type Node struct {
 }
 
 type Network struct {
-	Bits  int
-	Nodes map[int]*Node
+	bits  int
+	nodes map[int]*Node
 }
 
 func NewNetwork(ids []int, bits int) (*Network, error) {
@@ -32,8 +35,8 @@ func NewNetwork(ids []int, bits int) (*Network, error) {
 	size := 1 << bits
 
 	net := &Network{
-		Bits:  bits,
-		Nodes: make(map[int]*Node, len(ids)),
+		bits:  bits,
+		nodes: make(map[int]*Node, len(ids)),
 	}
 
 	for _, id := range ids {
@@ -44,17 +47,30 @@ func NewNetwork(ids []int, bits int) (*Network, error) {
 			)
 		}
 
-		if _, exists := net.Nodes[id]; exists {
+		if _, exists := net.nodes[id]; exists {
 			return nil, fmt.Errorf(
 				"узел с ID %d уже существует",
 				id,
 			)
 		}
 
-		net.Nodes[id] = &Node{
+		net.nodes[id] = &Node{
 			ID: id,
 		}
 	}
 
 	return net, nil
+}
+
+func (n *Network) Bits() int {
+	return n.bits
+}
+
+func (n *Network) NodeIDs() []int {
+	nodesIDs := make([]int, 0, len(n.nodes))
+	for id := range n.nodes {
+		nodesIDs = append(nodesIDs, id)
+	}
+	sort.Ints(nodesIDs)
+	return nodesIDs
 }
