@@ -3,16 +3,20 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Gubarenko-Vladislav/dht-lab/internal/api"
 )
 
 func main() {
-	const addr = ":8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
 	server := &http.Server{
-		Addr:              addr,
+		Addr:              ":" + port,
 		Handler:           api.NewHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
