@@ -1,1182 +1,1598 @@
 
 "use strict";
 
-// Вся маршрутизация Chord выполняется на Go.
-// Здесь только ввод параметров, запрос к API и визуализация полученных шагов.
+// Алгоритмы Chord и Kademlia выполняются в Go.
+// JavaScript только отправляет параметры и отображает результат.
+const MIN_BITS = 1;
+const MAX_BITS = 16;
+const DEFAULT_BITS = 6;
+const MAX_RANDOM_NODES = 100;
+
+const DEFAULT_IDS = [
+  4, 8, 14, 21, 32, 38, 42, 48, 51, 56,
+];
+
 const SVG_NS = "http://www.w3.org/2000/svg";
-const BITS = 6;
-const ID_SPACE = 1 << BITS;
-const DEFAULT_NODES = [4, 8, 14, 21, 32, 38, 42, 48, 51, 56];
+const $ = id => document.getElementById(id);
 
 const ui = {
-    nodeIds: document.getElementById("node-ids"),
-    createNetwork: document.getElementById("create-network"),
-    randomNetwork: document.getElementById("random-network"),
-    svg: document.getElementById("network-svg"),
-    algorithm: document.getElementById("algorithm"),
-    startNode: document.getElementById("start-node"),
-    targetId: document.getElementById("target-id"),
-    start: document.getElementById("start-btn"),
-    prev: document.getElementById("prev-btn"),
-    next: document.getElementById("next-btn"),
-    reset: document.getElementById("reset-btn"),
-    routing: document.getElementById("routing-table"),
-    description: document.getElementById("step-description"),
-    steps: document.getElementById("steps-list"),
-    result: document.getElementById("search-result"),
-    hops: document.getElementById("hops-count"),
-    requests: document.getElementById("requests-count"),
-    rounds: document.getElementById("rounds-count"),
+  ids: $("node-ids"),
+  create: $("create-network"),
+  random: $("random-network"),
+  svg: $("network-svg"),
+  algorithm: $("algorithm"),
+  startNode: $("start-node"),
+  target: $("target-id"),
+  start: $("start-btn"),
+  prev: $("prev-btn"),
+  next: $("next-btn"),
+  reset: $("reset-btn"),
+  table: $("routing-table"),
+  description: $("step-description"),
+  steps: $("steps-list"),
+  result: $("search-result"),
+  hops: $("hops-count"),
+  requests: $("requests-count"),
+  rounds: $("rounds-count"),
 };
 
 const state = {
-    nodes: [...DEFAULT_NODES],
-    lookup: null,
-    stepIndex: -1, // -1: ни один шаг ещё не показан.
-    loading: false,
-    controller: null,
-    requestVersion: 0,
+  bits: DEFAULT_BITS,
+  ids: [...DEFAULT_IDS],
+  lookup: null,
+  algorithm: null,
+  index: -1,
+  loading: false,
+  controller: null,
+  version: 0,
 };
 
-// --------------------------------------------------
-// Вспомогательные функции
-// --------------------------------------------------
-
-function svgElement(tag, attributes = {}) {
-    const element = document.createElementNS(SVG_NS, tag);
-
-    for (const [key, value] of Object.entries(attributes)) {
-        element.setAttribute(key, String(value));
-    }
-
-    return element;
+function idSpace() {
+  return 2 ** state.bits;
 }
 
-function svgText(parent, x, y, value, attrs = {}) {
-    const element = svgElement("text", { x, y, ...attrs });
-    element.textContent = String(value);
-    parent.appendChild(element);
-    return element;
+function maxID() {
+  return idSpace() - 1;
 }
 
-function svgLine(parent, x1, y1, x2, y2, attrs = {}) {
-    const element = svgElement("line", {
-        x1,
-        y1,
-        x2,
-        y2,
-        ...attrs,
-    });
+// --------------------------------------
+// Настройки сети и Kademlia
+// --------------------------------------
 
-    parent.appendChild(element);
-    return element;
+function numberSetting(title, value, min, max) {
+  const label = document.createElement("label");
+
+  label.style.cssText =
+    "display:grid;gap:6px;font-size:13px;min-width:145px";
+
+  const text = document.createElement("span");
+  text.textContent = title;
+
+  const input = document.createElement("input");
+
+  input.type = "number";
+  input.min = String(min);
+  input.max = String(max);
+  input.step = "1";
+  input.value = String(value);
+
+  input.style.cssText =
+    "width:120px;max-width:100%;padding:8px;" +
+    "background:#152033;color:#e2e8f0;" +
+    "border:1px solid #64748b;border-radius:7px";
+
+  label.append(text, input);
+
+  return { label, input };
 }
 
-function parseNodeIds(input) {
-    const parts = input.split(",").map(value => value.trim());
+const bitsSetting = numberSetting(
+  "Битность ID (1–16)",
+  6,
+  1,
+  16
+);
 
-    if (parts.length === 0 || parts.some(value => value === "")) {
-        throw new Error("Введите ID узлов через запятую.");
-    }
+const countSetting = numberSetting(
+  "Количество узлов",
+  10,
+  1,
+  100
+);
 
-    const ids = parts.map(value => {
-        if (!/^\d+$/.test(value)) {
-            throw new Error(`Некорректный ID узла: ${value}`);
-        }
+const kSetting = numberSetting(
+  "k — размер bucket",
+  3,
+  1,
+  64
+);
 
-        const id = Number(value);
+const alphaSetting = numberSetting(
+  "α — запросов за раунд",
+  2,
+  1,
+  3
+);
 
-        if (!Number.isSafeInteger(id) || id < 0 || id >= ID_SPACE) {
-            throw new Error(
-                `ID узлов должны находиться в диапазоне 0–${ID_SPACE - 1}.`
-            );
-        }
+const rangeHint = document.createElement("span");
 
-        return id;
-    });
+rangeHint.style.cssText =
+  "font-size:12px;color:#94a3b8;align-self:center";
 
-    if (new Set(ids).size !== ids.length) {
-        throw new Error("ID узлов не должны повторяться.");
-    }
+const networkPanel = document.createElement("div");
 
-    return ids.sort((a, b) => a - b);
+networkPanel.style.cssText =
+  "display:flex;align-items:end;gap:14px;flex-wrap:wrap;" +
+  "padding:10px 0;margin-top:8px";
+
+networkPanel.append(
+  bitsSetting.label,
+  countSetting.label,
+  rangeHint
+);
+
+ui.algorithm.insertAdjacentElement(
+  "afterend",
+  networkPanel
+);
+
+const kademliaPanel = document.createElement("div");
+
+kademliaPanel.style.cssText =
+  "display:flex;gap:18px;flex-wrap:wrap;padding:12px;" +
+  "border:1px solid #354158;border-radius:10px;margin-top:6px";
+
+kademliaPanel.append(
+  kSetting.label,
+  alphaSetting.label
+);
+
+networkPanel.insertAdjacentElement(
+  "afterend",
+  kademliaPanel
+);
+
+function updateControls() {
+  const maxCount = Math.min(
+    MAX_RANDOM_NODES,
+    idSpace()
+  );
+
+  countSetting.input.max = String(maxCount);
+
+  if (
+    Number(countSetting.input.value) > maxCount
+  ) {
+    countSetting.input.value = String(maxCount);
+  }
+
+  rangeHint.textContent =
+    `ID: 0–${maxID()} · максимум ${maxCount} узлов для генерации`;
+
+  ui.startNode.min = "0";
+  ui.startNode.max = String(maxID());
+
+  ui.target.min = "0";
+  ui.target.max = String(maxID());
+
+  ui.ids.placeholder =
+    `ID узлов от 0 до ${maxID()} через запятую`;
+
+  alphaSetting.input.max = kSetting.input.value;
+
+  kademliaPanel.style.display =
+    ui.algorithm.value === "kademlia"
+      ? "flex"
+      : "none";
 }
 
-function readId(input, name) {
-    const raw = input.value.trim();
-    const id = Number(raw);
+function readNodeCount() {
+  const raw = countSetting.input.value.trim();
+  const count = Number(raw);
 
-    if (
-        raw === "" ||
-        !Number.isInteger(id) ||
-        id < 0 ||
-        id >= ID_SPACE
-    ) {
-        throw new Error(
-            `${name}: укажите целое число от 0 до ${ID_SPACE - 1}.`
-        );
-    }
+  const limit = Math.min(
+    MAX_RANDOM_NODES,
+    idSpace()
+  );
 
-    return id;
+  if (
+    !/^\d+$/.test(raw) ||
+    !Number.isSafeInteger(count) ||
+    count < 1 ||
+    count > limit
+  ) {
+    throw new Error(
+      `Количество узлов: целое число от 1 до ${limit}.`
+    );
+  }
+
+  return count;
 }
 
-function optionalId(input) {
-    try {
-        return readId(input, "ID");
-    } catch {
-        return null;
-    }
+// Равномерное распределение ID при смене битности.
+function evenlySpacedIDs(count) {
+  return Array.from(
+    { length: count },
+    (_, i) => Math.floor(i * idSpace() / count)
+  );
 }
 
-function showMessage(description, result = null) {
-    ui.description.textContent = description;
+function changeBits() {
+  const raw = bitsSetting.input.value.trim();
+  const bits = Number(raw);
 
-    if (result !== null) {
-        ui.result.textContent = result;
-    }
+  if (
+    !/^\d+$/.test(raw) ||
+    !Number.isInteger(bits) ||
+    bits < MIN_BITS ||
+    bits > MAX_BITS
+  ) {
+    bitsSetting.input.value = String(state.bits);
+
+    message(
+      "Битность должна быть целым числом от 1 до 16."
+    );
+
+    return false;
+  }
+
+  if (bits === state.bits) {
+    return true;
+  }
+
+  state.bits = bits;
+
+  updateControls();
+
+  // При смене битности создаём сеть с выбранным
+  // количеством узлов в новом пространстве ID.
+  let count;
+
+  try {
+    count = readNodeCount();
+  } catch {
+    count = Math.min(10, idSpace());
+    countSetting.input.value = String(count);
+  }
+
+  state.ids = evenlySpacedIDs(count);
+
+  ui.ids.value = state.ids.join(", ");
+
+  ui.startNode.value = String(
+    state.ids[Math.min(1, count - 1)]
+  );
+
+  ui.target.value = String(
+    Math.round(maxID() * 0.85)
+  );
+
+  reset(
+    `Выбрано ${bits} бит. Создана сеть из ${count} узлов.`
+  );
+
+  return true;
+}
+
+// --------------------------------------
+// Ввод и состояние
+// --------------------------------------
+
+function parseIDs() {
+  const raw = ui.ids.value.trim();
+
+  if (!raw) {
+    throw new Error("Введите ID узлов.");
+  }
+
+  const parts = raw.split(/[,;\s]+/);
+
+  if (
+    parts.some(part => !/^\d+$/.test(part))
+  ) {
+    throw new Error(
+      "ID должны быть целыми неотрицательными числами."
+    );
+  }
+
+  const ids = parts.map(Number);
+
+  if (
+    ids.some(
+      id =>
+        !Number.isSafeInteger(id) ||
+        id > maxID()
+    )
+  ) {
+    throw new Error(
+      `При ${state.bits} битах допустимые ID: 0–${maxID()}.`
+    );
+  }
+
+  if (
+    new Set(ids).size !== ids.length
+  ) {
+    throw new Error(
+      "ID узлов не должны повторяться."
+    );
+  }
+
+  return ids.sort((a, b) => a - b);
+}
+
+function readID(input, label) {
+  const raw = input.value.trim();
+  const id = Number(raw);
+
+  if (
+    !/^\d+$/.test(raw) ||
+    !Number.isSafeInteger(id) ||
+    id > maxID()
+  ) {
+    throw new Error(
+      `${label}: укажите целое число от 0 до ${maxID()}.`
+    );
+  }
+
+  return id;
+}
+
+function optionalID(input) {
+  try {
+    return readID(input, "ID");
+  } catch {
+    return null;
+  }
+}
+
+function message(
+  description,
+  result = "Поиск ещё не выполнялся."
+) {
+  ui.description.textContent = description;
+  ui.result.textContent = result;
 }
 
 function updateButtons() {
-    const steps = state.lookup?.steps ?? [];
+  const count =
+    state.lookup?.steps?.length ?? 0;
 
-    ui.start.disabled = state.loading;
+  ui.start.disabled = state.loading;
 
-    ui.prev.disabled =
-        state.loading ||
-        !state.lookup ||
-        state.stepIndex < 0;
+  ui.prev.disabled =
+    state.loading ||
+    !state.lookup ||
+    state.index < 0;
 
-    ui.next.disabled =
-        state.loading ||
-        !state.lookup ||
-        state.stepIndex >= steps.length - 1;
+  ui.next.disabled =
+    state.loading ||
+    !state.lookup ||
+    state.index >= count - 1;
 }
 
-function cancelRequest() {
-    state.requestVersion++;
+function reset(
+  description = "Сеть готова. Начните поиск."
+) {
+  state.version++;
 
-    if (state.controller) {
-        state.controller.abort();
+  state.controller?.abort();
+
+  state.controller = null;
+  state.loading = false;
+  state.lookup = null;
+  state.algorithm = null;
+  state.index = -1;
+
+  ui.steps.replaceChildren();
+
+  ui.hops.textContent = "0";
+  ui.requests.textContent = "—";
+  ui.rounds.textContent = "—";
+
+  message(description);
+
+  render();
+}
+
+// --------------------------------------
+// HTML-таблицы узлов
+// --------------------------------------
+
+function makeTable(headings, rows) {
+  const table = document.createElement("table");
+  table.style.width = "100%";
+
+  const thead = document.createElement("thead");
+  const header = document.createElement("tr");
+
+  for (const value of headings) {
+    const th = document.createElement("th");
+
+    th.textContent = value;
+    header.appendChild(th);
+  }
+
+  thead.appendChild(header);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+
+  for (const values of rows) {
+    const tr = document.createElement("tr");
+
+    for (const value of values) {
+      const td = document.createElement("td");
+
+      td.textContent = String(value);
+      tr.appendChild(td);
     }
 
-    state.controller = null;
-    state.loading = false;
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+
+  return table;
 }
 
-function clearSimulation(
-    description = "Сеть готова. Выберите алгоритм и параметры поиска."
-) {
-    cancelRequest();
+// --------------------------------------
+// Таблицы текущих узлов
+// --------------------------------------
 
-    state.lookup = null;
-    state.stepIndex = -1;
+function showTable() {
+  ui.table.replaceChildren();
 
-    ui.steps.replaceChildren();
+  if (!state.lookup) {
+    ui.table.textContent =
+      "Запустите поиск, чтобы увидеть таблицы узлов.";
 
-    ui.hops.textContent = "0";
+    return;
+  }
 
-    // Эти метрики сервер пока не возвращает.
+  // Chord — Finger Table текущего узла.
+  if (state.algorithm === "chord") {
+    const id = state.index < 0
+      ? state.lookup.route[0]
+      : state.lookup.steps[state.index].to_id;
+
+    const h3 = document.createElement("h3");
+
+    h3.textContent = `Finger Table узла ${id}`;
+
+    ui.table.appendChild(h3);
+
+    const entries =
+      state.lookup.finger_tables?.[String(id)];
+
+    if (!Array.isArray(entries)) {
+      ui.table.append(
+        "Поле finger_tables отсутствует в ответе Go."
+      );
+
+      return;
+    }
+
+    ui.table.appendChild(
+      makeTable(
+        ["i", "Start", "Finger Node"],
+        entries.map((entry, i) => [
+          i,
+          entry.start,
+          entry.node_id,
+        ])
+      )
+    );
+
+    return;
+  }
+
+  // Kademlia — показываем buckets всех узлов,
+  // которые спрашивали в текущем раунде.
+  const step = state.index >= 0
+    ? state.lookup.steps[state.index]
+    : null;
+
+  const peers = step?.queried ??
+    [state.lookup.start_node];
+
+  const h3 = document.createElement("h3");
+
+  h3.textContent = step
+    ? `k-buckets узлов раунда ${step.round}: ${peers.join(", ")}`
+    : `k-buckets стартового узла ${state.lookup.start_node}`;
+
+  ui.table.appendChild(h3);
+
+  peers.forEach((id, i) => {
+    const buckets =
+      state.lookup.buckets?.[String(id)];
+
+    if (!Array.isArray(buckets)) {
+      return;
+    }
+
+    const details =
+      document.createElement("details");
+
+    details.open =
+      peers.length <= 3 || i === 0;
+
+    details.style.cssText =
+      "margin:10px 0;padding:9px 12px;" +
+      "border:1px solid #354158;border-radius:8px";
+
+    const summary =
+      document.createElement("summary");
+
+    summary.textContent = `Узел ${id}`;
+
+    summary.style.cssText =
+      "cursor:pointer;font-weight:600;margin-bottom:8px";
+
+    details.appendChild(summary);
+
+    details.appendChild(
+      makeTable(
+        [
+          "Bucket",
+          "XOR-расстояния",
+          "Контакты",
+        ],
+        buckets.map((bucket, j) => [
+          j,
+          `${2 ** j}–${2 ** (j + 1) - 1}`,
+          bucket.length
+            ? bucket.join(", ")
+            : "—",
+        ])
+      )
+    );
+
+    ui.table.appendChild(details);
+  });
+}
+
+// --------------------------------------
+// SVG: общие функции
+// --------------------------------------
+
+function svg(tag, attrs = {}, text) {
+  const el = document.createElementNS(
+    SVG_NS,
+    tag
+  );
+
+  for (const [name, value] of Object.entries(attrs)) {
+    el.setAttribute(
+      name,
+      String(value)
+    );
+  }
+
+  if (text !== undefined) {
+    el.textContent = String(text);
+  }
+
+  ui.svg.appendChild(el);
+
+  return el;
+}
+
+function addSVGTitle(element, text) {
+  const title = document.createElementNS(
+    SVG_NS,
+    "title"
+  );
+
+  title.textContent = text;
+  element.appendChild(title);
+}
+
+function ringPoint(id, radius = 145) {
+  const angle =
+    id * 2 * Math.PI / idSpace() -
+    Math.PI / 2;
+
+  return [
+    400 + radius * Math.cos(angle),
+    220 + radius * Math.sin(angle),
+  ];
+}
+
+// --------------------------------------
+// Chord: кольцо, маршрут, Finger Table
+// --------------------------------------
+
+function drawChord() {
+  svg("circle", {
+    cx: 400,
+    cy: 220,
+    r: 145,
+    fill: "none",
+    stroke: "#506078",
+    "stroke-width": 2,
+  });
+
+  svg("text", {
+    x: 400,
+    y: 208,
+    "text-anchor": "middle",
+    fill: "#e2e8f0",
+    "font-size": 19,
+  }, "CHORD");
+
+  svg("text", {
+    x: 400,
+    y: 234,
+    "text-anchor": "middle",
+    fill: "#94a3b8",
+    "font-size": 12,
+  }, `${state.bits} бит · ID 0–${maxID()} · узлов ${state.ids.length}`);
+
+  // На кольце рисуем не больше восьми отметок.
+  const tickCount = Math.min(
+    8,
+    idSpace()
+  );
+
+  for (let i = 0; i < tickCount; i++) {
+    const id = Math.floor(
+      i * idSpace() / tickCount
+    );
+
+    const [x, y] = ringPoint(id, 185);
+
+    svg("text", {
+      x,
+      y,
+      "text-anchor": "middle",
+      "dominant-baseline": "middle",
+      fill: "#94a3b8",
+      "font-size": 11,
+    }, id);
+  }
+
+  const target = optionalID(ui.target);
+
+  if (target !== null) {
+    const [cx, cy] = ringPoint(target);
+
+    svg("circle", {
+      cx,
+      cy,
+      r: 13,
+      fill: "none",
+      stroke: "#f6ad55",
+      "stroke-dasharray": "4 3",
+      "stroke-width": 2,
+    });
+  }
+
+  // Настоящий маршрут, полученный от Go.
+  const shown =
+    state.algorithm === "chord" &&
+    state.lookup
+      ? state.lookup.steps.slice(
+          0,
+          state.index + 1
+        )
+      : [];
+
+  shown.forEach((step, i) => {
+    if (step.from_id === step.to_id) {
+      return;
+    }
+
+    const [x1, y1] =
+      ringPoint(step.from_id);
+
+    const [x2, y2] =
+      ringPoint(step.to_id);
+
+    svg("line", {
+      x1,
+      y1,
+      x2,
+      y2,
+      stroke:
+        i === shown.length - 1
+          ? "#38bdf8"
+          : "#64748b",
+      "stroke-width": 3,
+    });
+  });
+
+  const active = shown.length
+    ? shown[shown.length - 1].to_id
+    : optionalID(ui.startNode);
+
+  const done =
+    state.algorithm === "chord" &&
+    state.lookup &&
+    state.index ===
+      state.lookup.steps.length - 1;
+
+  for (const id of state.ids) {
+    const [cx, cy] = ringPoint(id);
+
+    const owner =
+      done &&
+      id === state.lookup.owner_id;
+
+    const color = owner
+      ? "#68d391"
+      : id === active
+        ? "#38bdf8"
+        : "#94a3b8";
+
+    const circle = svg("circle", {
+      cx,
+      cy,
+      r: id === active ? 10 : 6,
+      fill: color,
+      stroke: "#e2e8f0",
+      "stroke-width": 1,
+    });
+
+    addSVGTitle(
+      circle,
+      `Узел ${id}${owner ? " — владелец ключа" : ""}`
+    );
+
+    // Когда узлов много, показываем подписи
+    // только важных узлов, иначе текст налезает.
+    if (
+      state.ids.length <= 28 ||
+      id === active ||
+      owner
+    ) {
+      const [x, y] = ringPoint(id, 169);
+
+      svg("text", {
+        x,
+        y,
+        "text-anchor": "middle",
+        "dominant-baseline": "middle",
+        fill: color,
+        "font-size":
+          state.ids.length > 28 ? 11 : 12,
+      }, id);
+    }
+  }
+
+  svg("text", {
+    x: 20,
+    y: 420,
+    fill: "#94a3b8",
+    "font-size": 12,
+  }, "Синий — текущий узел · зелёный — владелец · наведи на узел для ID");
+}
+
+// --------------------------------------
+// Kademlia: XOR и параллельные раунды
+// --------------------------------------
+
+function drawKademlia() {
+  const target = optionalID(ui.target);
+  const start = optionalID(ui.startNode);
+
+  svg("text", {
+    x: 22,
+    y: 32,
+    fill: "#e2e8f0",
+    "font-size": 18,
+  }, "KADEMLIA · XOR DISTANCE");
+
+  if (target === null) {
+    return;
+  }
+
+  // Текущий раунд.
+  const current =
+    state.algorithm === "kademlia" &&
+    state.index >= 0
+      ? state.lookup.steps[state.index]
+      : null;
+
+  const history =
+    state.algorithm === "kademlia"
+      ? state.lookup?.steps.slice(
+          0,
+          state.index + 1
+        ) ?? []
+      : [];
+
+  const active = new Set(
+    current?.queried ?? []
+  );
+
+  const previous = new Set(
+    history
+      .slice(0, -1)
+      .flatMap(s => s.queried)
+  );
+
+  const closest = new Set(
+    current?.closest ?? []
+  );
+
+  const originID =
+    state.lookup?.start_node ?? start;
+
+  svg("text", {
+    x: 22,
+    y: 56,
+    fill: "#93c5fd",
+    "font-size": 13,
+  }, current
+    ? `РАУНД ${current.round}: FIND_NODE(${target}) → [${current.queried.join(", ")}]`
+    : `Стартовый узел ${originID} · ${state.bits} бит · узлов ${state.ids.length}`
+  );
+
+  const left = 70;
+  const width = 660;
+  const axisY = 335;
+
+  const distanceX = d =>
+    left + d * width / maxID();
+
+  svg("line", {
+    x1: left,
+    y1: axisY,
+    x2: left + width,
+    y2: axisY,
+    stroke: "#94a3b8",
+  });
+
+  // Не больше девяти делений XOR-шкалы.
+  const ticks = new Set(
+    Array.from(
+      { length: 9 },
+      (_, i) => Math.round(i * maxID() / 8)
+    )
+  );
+
+  ticks.forEach(d => {
+    const x = distanceX(d);
+
+    svg("line", {
+      x1: x,
+      y1: axisY - 5,
+      x2: x,
+      y2: axisY + 5,
+      stroke: "#94a3b8",
+    });
+
+    svg("text", {
+      x,
+      y: axisY + 22,
+      "text-anchor": "middle",
+      fill: "#94a3b8",
+      "font-size": 11,
+    }, d);
+  });
+
+  svg("text", {
+    x: left,
+    y: 85,
+    fill: "#f6ad55",
+    "font-size": 12,
+  }, `Цель ${target} · XOR 0`);
+
+  const positions = new Map();
+
+  const lanes = [
+    -Infinity,
+    -Infinity,
+    -Infinity,
+    -Infinity,
+  ];
+
+  // XOR используется здесь для координат SVG.
+  // Сам алгоритм поиска работает на Go.
+  state.ids
+    .map(id => ({
+      id,
+      distance: id ^ target,
+    }))
+    .sort(
+      (a, b) => a.distance - b.distance
+    )
+    .forEach(({ id, distance }) => {
+      const x = distanceX(distance);
+
+      let lane = lanes.findIndex(
+        previousX => x - previousX >= 48
+      );
+
+      if (lane < 0) {
+        lane = lanes.indexOf(
+          Math.min(...lanes)
+        );
+      }
+
+      lanes[lane] = x;
+
+      positions.set(id, {
+        x,
+        y: 127 + lane * 51,
+        distance,
+      });
+    });
+
+  // Показываем обращения ко всем узлам
+  // текущего логически параллельного раунда.
+  const origin = positions.get(originID);
+
+  if (origin && current) {
+    for (const id of current.queried) {
+      const to = positions.get(id);
+
+      if (!to) {
+        continue;
+      }
+
+      svg("line", {
+        x1: origin.x,
+        y1: origin.y,
+        x2: to.x,
+        y2: to.y,
+        stroke: "#38bdf8",
+        "stroke-width": 2.5,
+        "stroke-dasharray": "6 5",
+        opacity: 0.7,
+      });
+    }
+  }
+
+  for (const id of state.ids) {
+    const {
+      x,
+      y,
+      distance,
+    } = positions.get(id);
+
+    const color = active.has(id)
+      ? "#38bdf8"
+      : closest.has(id)
+        ? "#68d391"
+        : previous.has(id)
+          ? "#64748b"
+          : id === originID
+            ? "#f59e0b"
+            : "#94a3b8";
+
+    svg("line", {
+      x1: x,
+      y1: y + 10,
+      x2: x,
+      y2: axisY,
+      stroke: color,
+      opacity: 0.45,
+    });
+
+    const circle = svg("circle", {
+      cx: x,
+      cy: y,
+      r: active.has(id) ? 10 : 7,
+      fill: color,
+      stroke: "#e2e8f0",
+    });
+
+    addSVGTitle(
+      circle,
+      `Узел ${id}; XOR до ${target} = ${distance}`
+    );
+
+    const important =
+      active.has(id) ||
+      closest.has(id) ||
+      id === originID;
+
+    // При большом количестве узлов
+    // оставляем только важные подписи.
+    if (
+      state.ids.length <= 25 ||
+      important
+    ) {
+      svg("text", {
+        x,
+        y: y - 14,
+        "text-anchor": "middle",
+        fill: color,
+        "font-size": 12,
+        "font-weight":
+          active.has(id) ? 700 : 400,
+      }, id);
+
+      if (state.ids.length <= 25) {
+        svg("text", {
+          x,
+          y: y + 25,
+          "text-anchor": "middle",
+          fill: "#94a3b8",
+          "font-size": 10,
+        }, `d=${distance}`);
+      }
+    }
+  }
+
+  svg("text", {
+    x: 22,
+    y: 415,
+    fill: "#94a3b8",
+    "font-size": 12,
+  }, "Синий — запросы раунда · зелёный — shortlist · оранжевый — старт");
+}
+
+// --------------------------------------
+// Общая отрисовка
+// --------------------------------------
+
+function render() {
+  ui.svg.replaceChildren();
+
+  ui.svg.setAttribute(
+    "viewBox",
+    "0 0 800 440"
+  );
+
+  if (ui.algorithm.value === "kademlia") {
+    drawKademlia();
+  } else {
+    drawChord();
+  }
+
+  showTable();
+  updateButtons();
+}
+
+// --------------------------------------
+// Отображение раундов Kademlia
+// --------------------------------------
+
+function makeRoundItem(step, selected) {
+  const li = document.createElement("li");
+
+  li.style.cssText =
+    `padding:12px;margin:8px 0;border:1px solid ${
+      selected ? "#38bdf8" : "#354158"
+    };border-radius:9px;list-style:none`;
+
+  const heading = document.createElement("strong");
+
+  heading.textContent =
+    `Раунд ${step.round} · спросили: ${step.queried.join(", ")}`;
+
+  li.appendChild(heading);
+
+  for (const reply of step.replies) {
+    const line = document.createElement("div");
+
+    line.style.cssText =
+      "margin-top:6px;color:#cbd5e1;font-size:13px";
+
+    line.textContent =
+      `Узел ${reply.peer_id} → [${reply.returned.join(", ") || "пусто"}]`;
+
+    li.appendChild(line);
+  }
+
+  const shortlist = document.createElement("div");
+
+  shortlist.style.cssText =
+    "margin-top:8px;color:#86efac;font-size:13px";
+
+  shortlist.textContent =
+    `Shortlist после раунда: [${step.closest.join(", ")}]`;
+
+  li.appendChild(shortlist);
+
+  return li;
+}
+
+// --------------------------------------
+// Пошаговый просмотр
+// --------------------------------------
+
+function showStep() {
+  ui.steps.replaceChildren();
+
+  if (!state.lookup) {
+    return render();
+  }
+
+  const steps = state.lookup.steps;
+
+  if (
+    steps.length === 0 &&
+    state.algorithm === "kademlia"
+  ) {
+    message(
+      "Запросы не потребовались.",
+      `Ближайшие узлы: ${state.lookup.closest_nodes.join(", ")}.`
+    );
+
+    ui.hops.textContent = "—";
+    ui.requests.textContent = "0";
+    ui.rounds.textContent = "0";
+
+    return render();
+  }
+
+  if (state.index < 0) {
+    message(
+      "Go выполнил поиск. Нажмите «Следующий шаг».",
+      "Результат готов к просмотру."
+    );
+
+    ui.hops.textContent =
+      state.algorithm === "chord" ? "0" : "—";
+
+    ui.requests.textContent =
+      state.algorithm === "kademlia" ? "0" : "—";
+
+    ui.rounds.textContent =
+      state.algorithm === "kademlia" ? "0" : "—";
+
+    return render();
+  }
+
+  steps
+    .slice(0, state.index + 1)
+    .forEach((step, i) => {
+      if (state.algorithm === "kademlia") {
+        ui.steps.appendChild(
+          makeRoundItem(
+            step,
+            i === state.index
+          )
+        );
+      } else {
+        const li = document.createElement("li");
+
+        li.textContent = step.description;
+
+        if (i === state.index) {
+          li.classList.add("active");
+        }
+
+        ui.steps.appendChild(li);
+      }
+    });
+
+  const step = steps[state.index];
+
+  const done =
+    state.index === steps.length - 1;
+
+  if (state.algorithm === "chord") {
+    const traversed = steps
+      .slice(0, state.index + 1)
+      .filter(
+        s => s.from_id !== s.to_id
+      ).length;
+
+    ui.description.textContent =
+      `Шаг ${state.index + 1}/${steps.length}: ${step.description}`;
+
+    ui.hops.textContent = String(
+      done ? state.lookup.hops : traversed
+    );
+
     ui.requests.textContent = "—";
     ui.rounds.textContent = "—";
 
-    showMessage(description, "Поиск ещё не выполнялся.");
+    ui.result.textContent = done
+      ? `Владелец ключа ${state.lookup.target_id}: ${state.lookup.owner_id}. ` +
+        `Маршрут: ${state.lookup.route.join(" → ")}.`
+      : `Пройдено переходов: ${traversed}.`;
 
-    renderRouting();
-    renderNetwork();
-    updateButtons();
+  } else {
+    // Один шаг Kademlia = один целый раунд.
+    ui.description.textContent =
+      `Раунд ${step.round}/${steps.length}: спросили ${step.queried.join(", ")}.`;
+
+    ui.hops.textContent = "—";
+
+    ui.requests.textContent =
+      String(step.requests);
+
+    ui.rounds.textContent =
+      String(step.round);
+
+    ui.result.textContent = done
+      ? (
+          state.lookup.exact_match
+            ? "Точный ID найден. "
+            : "Точного совпадения нет. "
+        ) +
+        `Ближайшие узлы: ${state.lookup.closest_nodes.join(", ")}. ` +
+        `Запросов: ${state.lookup.requests}, раундов: ${state.lookup.rounds}.`
+
+      : `Опрошено в раунде: ${step.queried.length}. ` +
+        `Ближайшие известные: ${step.closest.join(", ")}.`;
+  }
+
+  render();
 }
 
-// --------------------------------------------------
-// Таблица маршрутизации
-// --------------------------------------------------
-
-function renderRouting() {
-    ui.routing.replaceChildren();
-
-    const note = document.createElement("p");
-
-    if (ui.algorithm.value === "kademlia") {
-        note.textContent =
-            "k-buckets появятся после реализации Kademlia на Go.";
-    } else if (!state.lookup || state.stepIndex < 0) {
-        note.textContent =
-            "Finger Table пока не передаётся через Go API. " +
-            "После запуска поиска здесь будут видны решения маршрутизации.";
-    } else {
-        note.textContent =
-            "Выполненные решения Chord (это ещё не полная Finger Table):";
-    }
-
-    ui.routing.appendChild(note);
-
-    if (!state.lookup || state.stepIndex < 0) {
-        return;
-    }
-
-    const table = document.createElement("table");
-    const head = document.createElement("thead");
-    const headerRow = document.createElement("tr");
-
-    for (const title of ["От узла", "К узлу", "Действие"]) {
-        const cell = document.createElement("th");
-        cell.textContent = title;
-        headerRow.appendChild(cell);
-    }
-
-    head.appendChild(headerRow);
-    table.appendChild(head);
-
-    const body = document.createElement("tbody");
-
-    for (
-        const step of state.lookup.steps.slice(0, state.stepIndex + 1)
-    ) {
-        const row = document.createElement("tr");
-
-        for (const value of [
-            step.from_id,
-            step.to_id,
-            step.action,
-        ]) {
-            const cell = document.createElement("td");
-            cell.textContent = String(value);
-            row.appendChild(cell);
-        }
-
-        body.appendChild(row);
-    }
-
-    table.appendChild(body);
-    ui.routing.appendChild(table);
-}
-
-// --------------------------------------------------
-// CHORD: визуализация кольца
-// --------------------------------------------------
-
-function chordPosition(id, radius = 140) {
-    const angle =
-        (id / ID_SPACE) * Math.PI * 2 - Math.PI / 2;
-
-    return {
-        x: 400 + Math.cos(angle) * radius,
-        y: 220 + Math.sin(angle) * radius,
-    };
-}
-
-function addArrowMarkers() {
-    const defs = svgElement("defs");
-
-    for (const [id, color] of [
-        ["route-previous", "#64748b"],
-        ["route-active", "#63b3ed"],
-    ]) {
-        const marker = svgElement("marker", {
-            id,
-            markerWidth: 7,
-            markerHeight: 7,
-            refX: 6,
-            refY: 3.5,
-            orient: "auto",
-        });
-
-        marker.appendChild(svgElement("path", {
-            d: "M0 0 L7 3.5 L0 7 Z",
-            fill: color,
-        }));
-
-        defs.appendChild(marker);
-    }
-
-    ui.svg.appendChild(defs);
-}
-
-function renderChord() {
-    ui.svg.replaceChildren();
-    addArrowMarkers();
-
-    // Основное кольцо.
-    ui.svg.appendChild(svgElement("circle", {
-        cx: 400,
-        cy: 220,
-        r: 140,
-        fill: "none",
-        stroke: "#354158",
-        "stroke-width": 2,
-    }));
-
-    // Отметки ID-пространства.
-    for (let id = 0; id < ID_SPACE; id++) {
-        const inner = chordPosition(
-            id,
-            id % 8 === 0 ? 145 : 147
-        );
-
-        const outer = chordPosition(
-            id,
-            id % 8 === 0 ? 154 : 151
-        );
-
-        svgLine(
-            ui.svg,
-            inner.x,
-            inner.y,
-            outer.x,
-            outer.y,
-            {
-                stroke: id % 8 === 0 ? "#8292ad" : "#354158",
-                "stroke-width": id % 8 === 0 ? 1.4 : 0.8,
-            }
-        );
-    }
-
-    // Подписи главных делений.
-    for (let id = 0; id < ID_SPACE; id += 8) {
-        const p = chordPosition(id, 184);
-
-        svgText(ui.svg, p.x, p.y, id, {
-            "text-anchor": "middle",
-            "dominant-baseline": "middle",
-            "font-size": 12,
-        });
-    }
-
-    // Центральная информация.
-    svgText(ui.svg, 400, 205, "CHORD", {
-        "text-anchor": "middle",
-        "font-weight": 700,
-        "font-size": 18,
-    }).style.fill = "#e8eef8";
-
-    svgText(ui.svg, 400, 226, `ID: 0–${ID_SPACE - 1}`, {
-        "text-anchor": "middle",
-        "font-size": 12,
-    });
-
-    svgText(ui.svg, 400, 246, `Узлов: ${state.nodes.length}`, {
-        "text-anchor": "middle",
-        "font-size": 12,
-    });
-
-    const target = optionalId(ui.targetId);
-    const start = optionalId(ui.startNode);
-
-    // Целевой ключ.
-    if (target !== null) {
-        const p = chordPosition(target);
-
-        ui.svg.appendChild(svgElement("circle", {
-            cx: p.x,
-            cy: p.y,
-            r: 13,
-            fill: "none",
-            stroke: "#f6ad55",
-            "stroke-width": 2,
-            "stroke-dasharray": "4 3",
-        }));
-
-        const marker = svgElement("circle", {
-            cx: p.x,
-            cy: p.y,
-            r: 4,
-            fill: "#f6ad55",
-        });
-
-        const title = svgElement("title");
-        title.textContent = `Целевой ключ ${target}`;
-
-        marker.appendChild(title);
-        ui.svg.appendChild(marker);
-    }
-
-    // Берём только те шаги, которые уже показаны пользователю.
-    const visibleSteps = state.lookup
-        ? state.lookup.steps.slice(0, state.stepIndex + 1)
-        : [];
-
-    // Рисуем переходы, полученные от Go.
-    visibleSteps.forEach((step, index) => {
-        if (step.from_id === step.to_id) {
-            return;
-        }
-
-        const a = chordPosition(step.from_id);
-        const b = chordPosition(step.to_id);
-
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-
-        const distance = Math.hypot(dx, dy) || 1;
-        const ux = dx / distance;
-        const uy = dy / distance;
-
-        const startX = a.x + ux * 13;
-        const startY = a.y + uy * 13;
-
-        const endX = b.x - ux * 13;
-        const endY = b.y - uy * 13;
-
-        const bend = Math.min(distance * 0.13, 35);
-
-        const controlX =
-            (startX + endX) / 2 - uy * bend;
-
-        const controlY =
-            (startY + endY) / 2 + ux * bend;
-
-        const active = index === state.stepIndex;
-
-        const path = svgElement("path", {
-            d:
-                `M ${startX} ${startY} ` +
-                `Q ${controlX} ${controlY} ${endX} ${endY}`,
-            fill: "none",
-            stroke: active ? "#63b3ed" : "#64748b",
-            "stroke-width": active ? 3.5 : 2,
-            "stroke-linecap": "round",
-            "marker-end": active
-                ? "url(#route-active)"
-                : "url(#route-previous)",
-            opacity: active ? 1 : 0.7,
-        });
-
-        ui.svg.appendChild(path);
-    });
-
-    // Текущий шаг.
-    const activeStep = state.stepIndex >= 0
-        ? state.lookup?.steps[state.stepIndex]
-        : null;
-
-    const activeNode = activeStep
-        ? activeStep.to_id
-        : start;
-
-    const atEnd =
-        state.lookup &&
-        state.stepIndex === state.lookup.steps.length - 1;
-
-    // Узлы сети.
-    for (const id of state.nodes) {
-        const p = chordPosition(id);
-
-        const isStart = id === start;
-        const isActive = id === activeNode;
-
-        const isOwner = Boolean(
-            atEnd && id === state.lookup.owner_id
-        );
-
-        const circle = svgElement("circle", {
-            cx: p.x,
-            cy: p.y,
-            r: isActive ? 10 : 7,
-            fill: isOwner
-                ? "#68d391"
-                : isActive
-                    ? "#63b3ed"
-                    : "#8292ad",
-            stroke: isActive ? "#e8f6ff" : "#a7b4c9",
-            "stroke-width": isActive ? 2.5 : 1.4,
-        });
-
-        const title = svgElement("title");
-
-        title.textContent =
-            `Узел ${id}` +
-            (isStart ? " — старт" : "") +
-            (isOwner ? " — владелец" : "");
-
-        circle.appendChild(title);
-        ui.svg.appendChild(circle);
-
-        // Подпись узла.
-        const labelPos = chordPosition(id, 166);
-
-        const label = svgText(
-            ui.svg,
-            labelPos.x,
-            labelPos.y,
-            id,
-            {
-                "text-anchor": "middle",
-                "dominant-baseline": "middle",
-                "font-size": 12,
-                "font-weight": isActive ? 700 : 500,
-            }
-        );
-
-        label.style.fill = isOwner
-            ? "#68d391"
-            : isActive
-                ? "#63b3ed"
-                : "#c4cede";
-    }
-
-    // Легенда.
-    svgText(
-        ui.svg,
-        24,
-        423,
-        "● Старт / активный узел",
-        { "font-size": 12 }
-    ).style.fill = "#63b3ed";
-
-    svgText(
-        ui.svg,
-        260,
-        423,
-        "◎ Целевой ключ",
-        { "font-size": 12 }
-    ).style.fill = "#f6ad55";
-
-    ui.svg.setAttribute(
-        "aria-label",
-        `Chord: кольцо из ${state.nodes.length} узлов, ` +
-        `цель ${target ?? "не задана"}`
+// --------------------------------------
+// Проверка ответа Go
+// --------------------------------------
+
+function validateReply(payload, algorithm) {
+  const result = payload?.[algorithm];
+
+  if (
+    payload?.algorithm !== algorithm ||
+    !result ||
+    !Array.isArray(result.steps)
+  ) {
+    throw new Error(
+      "Go вернул неверный формат JSON."
     );
+  }
+
+  if (
+    algorithm === "chord" &&
+    !Array.isArray(result.route)
+  ) {
+    throw new Error(
+      "В ответе отсутствует маршрут Chord."
+    );
+  }
+
+  if (
+    algorithm === "kademlia" &&
+    (
+      !Array.isArray(result.closest_nodes) ||
+      !result.buckets ||
+      result.steps.some(step =>
+        !Array.isArray(step.queried) ||
+        !Array.isArray(step.replies) ||
+        !Array.isArray(step.closest)
+      )
+    )
+  ) {
+    throw new Error(
+      "Неверный формат раундов Kademlia: обновите kademlia.go."
+    );
+  }
+
+  return result;
 }
 
-// --------------------------------------------------
-// KADEMLIA: визуализация XOR-расстояний
-// --------------------------------------------------
+// --------------------------------------
+// HTTP API
+// --------------------------------------
 
-// Здесь только визуализация расстояний.
-// Алгоритм поиска Kademlia в JavaScript не реализуется.
+async function start() {
+  if (!changeBits()) {
+    return;
+  }
 
-function renderKademlia() {
-    ui.svg.replaceChildren();
+  let ids;
+  let startID;
+  let targetID;
 
-    svgText(
-        ui.svg,
-        24,
-        32,
-        "KADEMLIA · XOR DISTANCE",
-        {
-            "font-size": 17,
-            "font-weight": 700,
-        }
-    ).style.fill = "#e8eef8";
+  try {
+    ids = parseIDs();
 
-    svgText(
-        ui.svg,
-        24,
-        56,
-        "Визуальная карта расстояний — не маршрут поиска",
-        { "font-size": 12 }
+    startID = readID(
+      ui.startNode,
+      "Начальный узел"
     );
 
-    const target = optionalId(ui.targetId);
-    const start = optionalId(ui.startNode);
-
-    if (target === null) {
-        svgText(
-            ui.svg,
-            400,
-            220,
-            "Укажите целевой ID",
-            {
-                "text-anchor": "middle",
-                "font-size": 14,
-            }
-        );
-
-        return;
-    }
-
-    const left = 70;
-    const right = 750;
-    const axisY = 330;
-
-    const xFor = distance =>
-        left +
-        (distance / (ID_SPACE - 1)) * (right - left);
-
-    // Шкала расстояний.
-    svgLine(
-        ui.svg,
-        left,
-        axisY,
-        right,
-        axisY,
-        {
-            stroke: "#71829e",
-            "stroke-width": 1.5,
-        }
+    targetID = readID(
+      ui.target,
+      "Целевой ID"
     );
 
-    for (
-        let distance = 0;
-        distance < ID_SPACE;
-        distance += 8
-    ) {
-        const x = xFor(distance);
-
-        svgLine(
-            ui.svg,
-            x,
-            axisY - 6,
-            x,
-            axisY + 6,
-            {
-                stroke: "#71829e",
-            }
-        );
-
-        svgText(
-            ui.svg,
-            x,
-            axisY + 24,
-            distance,
-            {
-                "text-anchor": "middle",
-                "font-size": 11,
-            }
-        );
+    if (!ids.includes(startID)) {
+      throw new Error(
+        "Стартового узла нет в сети."
+      );
     }
 
-    svgText(
-        ui.svg,
-        xFor(ID_SPACE - 1),
-        axisY + 24,
-        ID_SPACE - 1,
-        {
-            "text-anchor": "middle",
-            "font-size": 11,
-        }
-    );
+  } catch (error) {
+    reset(error.message);
+    return;
+  }
 
-    // Цель находится на расстоянии XOR = 0.
-    svgLine(
-        ui.svg,
-        left,
-        90,
-        left,
-        axisY,
-        {
-            stroke: "#f6ad55",
-            "stroke-dasharray": "5 4",
-        }
-    );
+  state.ids = ids;
+  reset();
 
-    svgText(
-        ui.svg,
-        left + 8,
-        84,
-        `Target ${target}`,
-        {
-            "font-weight": 700,
-            "font-size": 12,
-        }
-    ).style.fill = "#f6ad55";
+  const algorithm = ui.algorithm.value;
 
-    // XOR используется только для размещения узлов на карте.
-    const sorted = state.nodes
-        .map(id => ({
-            id,
-            distance: id ^ target,
-        }))
-        .sort((a, b) => a.distance - b.distance);
+  const body = {
+    algorithm,
+    bits: state.bits,
+    nodes: ids,
+    start_node: startID,
+    target_id: targetID,
+  };
 
-    const lanes = [112, 162, 212, 262];
-    const lastX = lanes.map(() => -Infinity);
-
-    for (const item of sorted) {
-        const x = xFor(item.distance);
-
-        let lane = lastX.findIndex(
-            previousX => x - previousX >= 50
-        );
-
-        if (lane === -1) {
-            lane = lastX.indexOf(Math.min(...lastX));
-        }
-
-        lastX[lane] = x;
-
-        const y = lanes[lane];
-        const isStart = item.id === start;
-
-        svgLine(
-            ui.svg,
-            x,
-            y + 9,
-            x,
-            axisY - 5,
-            {
-                stroke: isStart ? "#63b3ed" : "#354158",
-                "stroke-width": isStart ? 1.8 : 1,
-            }
-        );
-
-        const node = svgElement("circle", {
-            cx: x,
-            cy: y,
-            r: isStart ? 8 : 6,
-            fill: isStart ? "#63b3ed" : "#8292ad",
-            stroke: isStart ? "#e8f6ff" : "#a7b4c9",
-        });
-
-        const tooltip = svgElement("title");
-
-        tooltip.textContent =
-            `Узел ${item.id}, ` +
-            `расстояние XOR: ${item.distance}`;
-
-        node.appendChild(tooltip);
-        ui.svg.appendChild(node);
-
-        // ID узла.
-        svgText(
-            ui.svg,
-            x,
-            y - 14,
-            item.id,
-            {
-                "text-anchor": "middle",
-                "font-size": 12,
-                "font-weight": isStart ? 700 : 500,
-            }
-        ).style.fill = isStart ? "#63b3ed" : "#c4cede";
-
-        // XOR-расстояние.
-        svgText(
-            ui.svg,
-            x,
-            y + 22,
-            `d=${item.distance}`,
-            {
-                "text-anchor": "middle",
-                "font-size": 10,
-            }
-        );
-    }
-
-    svgText(
-        ui.svg,
-        24,
-        410,
-        "d = nodeID XOR targetID · Меньше d — ближе по XOR",
-        { "font-size": 12 }
-    );
-
-    ui.svg.setAttribute(
-        "aria-label",
-        `Kademlia: XOR-расстояния ${state.nodes.length} ` +
-        `узлов до ID ${target}`
-    );
-}
-
-// --------------------------------------------------
-// Выбор визуализации
-// --------------------------------------------------
-
-function renderNetwork() {
-    if (ui.algorithm.value === "kademlia") {
-        renderKademlia();
-    } else {
-        renderChord();
-    }
-}
-
-// --------------------------------------------------
-// Пошаговая визуализация результатов Go
-// --------------------------------------------------
-
-function renderSimulationStep() {
-    ui.steps.replaceChildren();
-
-    if (!state.lookup) {
-        updateButtons();
-        return;
-    }
-
-    const {
-        steps,
-        route,
-        hops,
-        owner_id: ownerId,
-        target_id: targetId,
-    } = state.lookup;
-
-    // Результат получен, но пользователь ещё
-    // не начал просматривать шаги.
-    if (state.stepIndex < 0) {
-        showMessage(
-            `Go выполнил поиск Chord от узла ${route[0]} ` +
-            `для ключа ${targetId}. ` +
-            "Нажмите «Следующий шаг», чтобы начать просмотр.",
-            "Маршрут пока не показан."
-        );
-
-        ui.hops.textContent = "0";
-    } else {
-        // Формируем список уже показанных шагов.
-        for (let i = 0; i <= state.stepIndex; i++) {
-            const step = steps[i];
-
-            const li = document.createElement("li");
-
-            li.textContent =
-                `${step.from_id} → ${step.to_id} ` +
-                `(${step.action}): ${step.description}`;
-
-            if (i === state.stepIndex) {
-                li.classList.add("active");
-            }
-
-            ui.steps.appendChild(li);
-        }
-
-        const currentStep = steps[state.stepIndex];
-
-        const completed =
-            state.stepIndex === steps.length - 1;
-
-        // Количество реально показанных переходов.
-        const traversed = steps
-            .slice(0, state.stepIndex + 1)
-            .filter(step => step.from_id !== step.to_id)
-            .length;
-
-        ui.hops.textContent = String(
-            completed ? hops : traversed
-        );
-
-        ui.description.textContent =
-            `Шаг ${state.stepIndex + 1} из ${steps.length}. ` +
-            currentStep.description;
-
-        if (completed) {
-            ui.result.textContent =
-                `Поиск завершён. ` +
-                `Владелец ключа ${targetId}: узел ${ownerId}. ` +
-                `Маршрут: ${route.join(" → ")}. ` +
-                `Переходов: ${hops}.`;
-        } else {
-            ui.result.textContent =
-                `Показано переходов: ${traversed}. ` +
-                "Поиск продолжается.";
-        }
-    }
-
-    renderRouting();
-    renderNetwork();
-    updateButtons();
-}
-
-// --------------------------------------------------
-// Проверка результата Go API
-// --------------------------------------------------
-
-function requireLookupPayload(payload) {
-    const lookup = payload?.chord;
-
-    if (payload?.algorithm !== "chord" || !lookup) {
-        throw new Error(
-            "Сервер вернул неожиданный формат результата Chord."
-        );
-    }
+  if (algorithm === "kademlia") {
+    body.k = Number(kSetting.input.value);
+    body.alpha = Number(alphaSetting.input.value);
 
     if (
-        !Array.isArray(lookup.route) ||
-        !Array.isArray(lookup.steps) ||
-        !Number.isInteger(lookup.owner_id) ||
-        !Number.isInteger(lookup.hops) ||
-        !Number.isInteger(lookup.target_id) ||
-        !lookup.steps.every(step =>
-            Number.isInteger(step.from_id) &&
-            Number.isInteger(step.to_id) &&
-            typeof step.action === "string" &&
-            typeof step.description === "string"
-        )
+      !Number.isInteger(body.k) ||
+      body.k < 1 ||
+      body.k > 64 ||
+      !Number.isInteger(body.alpha) ||
+      body.alpha < 1 ||
+      body.alpha > body.k
     ) {
-        throw new Error(
-            "Ответ Go API не содержит корректный маршрут или шаги."
-        );
+      message(
+        "Укажите k от 1 до 64 и α от 1 до k."
+      );
+
+      return;
     }
+  }
 
-    return lookup;
-}
+  const version = ++state.version;
+  const controller = new AbortController();
 
-// --------------------------------------------------
-// Запуск симуляции через Go API
-// --------------------------------------------------
+  state.controller = controller;
+  state.loading = true;
 
-async function startSimulation() {
-    let ids;
-    let startNode;
-    let targetId;
+  updateButtons();
 
-    // Сначала проверяем данные пользователя.
-    try {
-        ids = parseNodeIds(ui.nodeIds.value);
+  message(
+    `Go выполняет поиск ${algorithm} (${state.bits} бит)...`,
+    "Ожидается ответ API."
+  );
 
-        startNode = readId(
-            ui.startNode,
-            "Начальный узел"
-        );
+  try {
+    const response = await fetch(
+      "/api/lookup",
+      {
+        method: "POST",
 
-        targetId = readId(
-            ui.targetId,
-            "Целевой ID"
-        );
+        headers: {
+          "Content-Type": "application/json",
+        },
 
-        if (!ids.includes(startNode)) {
-            throw new Error(
-                `Начальный узел ${startNode} отсутствует в сети.`
-            );
-        }
-    } catch (error) {
-        clearSimulation(error.message);
-        return;
-    }
+        body: JSON.stringify(body),
 
-    state.nodes = ids;
-    clearSimulation();
-
-    // Kademlia пока не реализована на Go.
-    if (ui.algorithm.value !== "chord") {
-        showMessage(
-            "Поиск Kademlia пока не реализован на Go. " +
-            "Сейчас доступна только карта XOR-расстояний.",
-            "Результата поиска Kademlia пока нет."
-        );
-
-        return;
-    }
-
-    // Идентификатор запроса защищает от устаревших ответов.
-    const version = ++state.requestVersion;
-
-    const controller = new AbortController();
-    state.controller = controller;
-
-    state.loading = true;
-    updateButtons();
-
-    showMessage(
-        "Выполняется поиск Chord на Go...",
-        "Ожидается результат HTTP API."
+        signal: controller.signal,
+      }
     );
 
-    try {
-        // Настоящий HTTP-запрос к твоему Go-бэкенду.
-        const response = await fetch("/api/lookup", {
-            method: "POST",
+    const type =
+      response.headers.get("content-type") ?? "";
 
-            headers: {
-                "Content-Type": "application/json",
-            },
+    const payload =
+      type.includes("application/json")
+        ? await response.json()
+        : await response.text();
 
-            body: JSON.stringify({
-                algorithm: "chord",
-                bits: BITS,
-                nodes: ids,
-                start_node: startNode,
-                target_id: targetId,
-            }),
-
-            signal: controller.signal,
-        });
-
-        const contentType =
-            response.headers.get("content-type") || "";
-
-        // Go может вернуть как JSON, так и текст ошибки.
-        const data = contentType.includes("application/json")
-            ? await response.json()
-            : await response.text();
-
-        if (version !== state.requestVersion) {
-            return;
-        }
-
-        if (!response.ok) {
-            const reason = typeof data === "string"
-                ? data.trim()
-                : data?.error || `HTTP ${response.status}`;
-
-            throw new Error(
-                reason || `HTTP ${response.status}`
-            );
-        }
-
-        // Результат вычислен Go.
-        state.lookup = requireLookupPayload(data);
-
-        // Начинаем с нулевого состояния визуализации.
-        state.stepIndex = -1;
-
-        renderSimulationStep();
-
-    } catch (error) {
-        if (
-            version !== state.requestVersion ||
-            error.name === "AbortError"
-        ) {
-            return;
-        }
-
-        state.lookup = null;
-
-        showMessage(
-            `Ошибка поиска: ${error.message}`,
-            "Поиск не выполнен."
-        );
-
-        renderRouting();
-        renderNetwork();
-
-    } finally {
-        if (version === state.requestVersion) {
-            state.controller = null;
-            state.loading = false;
-            updateButtons();
-        }
-    }
-}
-
-// --------------------------------------------------
-// Создание сети
-// --------------------------------------------------
-
-function createNetwork() {
-    try {
-        state.nodes = parseNodeIds(ui.nodeIds.value);
-
-        ui.nodeIds.value = state.nodes.join(", ");
-
-        clearSimulation(
-            `Создана сеть из ${state.nodes.length} узлов.`
-        );
-
-    } catch (error) {
-        clearSimulation(error.message);
-    }
-}
-
-// --------------------------------------------------
-// Генерация случайной сети
-// --------------------------------------------------
-
-function randomNetwork() {
-    const ids = new Set();
-
-    // Генерируем 10 уникальных ID.
-    while (ids.size < 10) {
-        ids.add(
-            Math.floor(Math.random() * ID_SPACE)
-        );
+    if (version !== state.version) {
+      return;
     }
 
-    state.nodes = [...ids].sort((a, b) => a - b);
+    if (!response.ok) {
+      throw new Error(
+        typeof payload === "string"
+          ? payload.trim()
+          : payload?.error ||
+              `HTTP ${response.status}`
+      );
+    }
 
-    ui.nodeIds.value = state.nodes.join(", ");
-
-    // Выбираем существующий стартовый узел.
-    const randomIndex = Math.floor(
-        Math.random() * state.nodes.length
+    state.lookup = validateReply(
+      payload,
+      algorithm
     );
 
-    ui.startNode.value = String(
-        state.nodes[randomIndex]
+    state.algorithm = algorithm;
+    state.index = -1;
+
+    showStep();
+
+  } catch (error) {
+    if (
+      version !== state.version ||
+      error.name === "AbortError"
+    ) {
+      return;
+    }
+
+    state.lookup = null;
+
+    message(
+      `Ошибка: ${error.message}`,
+      "Поиск не выполнен."
     );
 
-    clearSimulation(
-        `Сгенерирована сеть из ${state.nodes.length} узлов.`
-    );
+    render();
+
+  } finally {
+    if (version === state.version) {
+      state.loading = false;
+      state.controller = null;
+
+      updateButtons();
+    }
+  }
 }
 
-// --------------------------------------------------
-// Обработчики событий
-// --------------------------------------------------
+// --------------------------------------
+// События интерфейса
+// --------------------------------------
 
-// Создать сеть.
-ui.createNetwork.addEventListener(
-    "click",
-    createNetwork
-);
+// Создать сеть из введённых ID.
+ui.create.addEventListener("click", () => {
+  if (!changeBits()) {
+    return;
+  }
 
-// Случайная сеть.
-ui.randomNetwork.addEventListener(
-    "click",
-    randomNetwork
-);
+  try {
+    state.ids = parseIDs();
+
+    ui.ids.value = state.ids.join(", ");
+
+    reset(
+      `Сеть создана: ${state.ids.length} узлов.`
+    );
+
+  } catch (error) {
+    reset(error.message);
+  }
+});
+
+// Создать случайную сеть с выбранным числом узлов.
+ui.random.addEventListener("click", () => {
+  if (!changeBits()) {
+    return;
+  }
+
+  let count;
+
+  try {
+    count = readNodeCount();
+  } catch (error) {
+    message(error.message);
+    return;
+  }
+
+  const unique = new Set();
+
+  // Продолжаем, пока не получим ровно count
+  // уникальных ID из пространства 0–2^bits-1.
+  while (unique.size < count) {
+    unique.add(
+      Math.floor(Math.random() * idSpace())
+    );
+  }
+
+  state.ids = [...unique].sort(
+    (a, b) => a - b
+  );
+
+  ui.ids.value = state.ids.join(", ");
+
+  ui.startNode.value = String(
+    state.ids[0]
+  );
+
+  reset(
+    `Сгенерировано ${count} узлов (${state.bits} бит).`
+  );
+});
 
 // Начать поиск.
 ui.start.addEventListener(
-    "click",
-    startSimulation
+  "click",
+  start
 );
 
-// Сбросить симуляцию.
-ui.reset.addEventListener("click", () => {
-    clearSimulation(
-        "Симуляция сброшена. Сеть и параметры сохранены."
-    );
-});
-
-// Шаг назад.
+// Предыдущий шаг / раунд.
 ui.prev.addEventListener("click", () => {
-    if (
-        state.lookup &&
-        state.stepIndex >= 0
-    ) {
-        state.stepIndex--;
-        renderSimulationStep();
-    }
+  if (
+    state.lookup &&
+    state.index >= 0
+  ) {
+    state.index--;
+    showStep();
+  }
 });
 
-// Следующий шаг.
+// Следующий шаг / раунд.
 ui.next.addEventListener("click", () => {
-    if (
-        state.lookup &&
-        state.stepIndex < state.lookup.steps.length - 1
-    ) {
-        state.stepIndex++;
-        renderSimulationStep();
+  if (
+    state.lookup &&
+    state.index <
+      state.lookup.steps.length - 1
+  ) {
+    state.index++;
+    showStep();
+  }
+});
+
+// Сброс.
+ui.reset.addEventListener("click", () => {
+  reset("Симуляция сброшена.");
+});
+
+// Выбор алгоритма.
+ui.algorithm.addEventListener(
+  "change",
+  () => {
+    updateControls();
+    reset("Алгоритм изменён.");
+  }
+);
+
+// Изменение битности.
+bitsSetting.input.addEventListener(
+  "change",
+  changeBits
+);
+
+// Количество узлов влияет на следующую генерацию,
+// но не меняет уже созданную сеть.
+countSetting.input.addEventListener(
+  "change",
+  () => {
+    try {
+      readNodeCount();
+    } catch (error) {
+      message(error.message);
     }
-});
+  }
+);
 
-// Смена алгоритма.
-ui.algorithm.addEventListener("change", () => {
-    clearSimulation(
-        "Алгоритм изменён. Начните новый поиск."
+// Изменение ID или alpha сбрасывает поиск.
+for (const input of [
+  ui.ids,
+  ui.startNode,
+  ui.target,
+  alphaSetting.input,
+]) {
+  input.addEventListener("input", () => {
+    reset(
+      "Параметры изменены. Начните поиск заново."
     );
-});
-
-// Изменение стартового узла.
-ui.startNode.addEventListener("input", () => {
-    clearSimulation(
-        "Начальный узел изменён. Начните новый поиск."
-    );
-});
-
-// Изменение целевого ID.
-ui.targetId.addEventListener("input", () => {
-    clearSimulation(
-        "Целевой ID изменён. Начните новый поиск."
-    );
-});
-
-// Изменение списка узлов.
-ui.nodeIds.addEventListener("input", () => {
-    clearSimulation(
-        "Список ID изменён. " +
-        "Нажмите «Создать сеть» или «Начать»."
-    );
-});
-
-// --------------------------------------------------
-// Инициализация приложения
-// --------------------------------------------------
-
-try {
-    state.nodes = parseNodeIds(ui.nodeIds.value);
-} catch {
-    state.nodes = [...DEFAULT_NODES];
-    ui.nodeIds.value = DEFAULT_NODES.join(", ");
+  });
 }
 
-clearSimulation();
+// При изменении k обновляем допустимое alpha.
+kSetting.input.addEventListener(
+  "input",
+  () => {
+    alphaSetting.input.max =
+      kSetting.input.value;
+
+    if (
+      Number(alphaSetting.input.value) >
+      Number(kSetting.input.value)
+    ) {
+      alphaSetting.input.value =
+        kSetting.input.value;
+    }
+
+    reset(
+      "Параметры Kademlia изменены."
+    );
+  }
+);
+
+// --------------------------------------
+// Инициализация
+// --------------------------------------
+
+try {
+  state.ids = parseIDs();
+} catch {
+  state.ids = [...DEFAULT_IDS];
+
+  ui.ids.value =
+    DEFAULT_IDS.join(", ");
+}
+
+updateControls();
+reset();

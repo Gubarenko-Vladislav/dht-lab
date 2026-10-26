@@ -11,7 +11,6 @@ type Node struct {
 	network.Node
 
 	Successor   int
-	Predecessor int
 	FingerTable []int
 }
 
@@ -19,6 +18,27 @@ type Ring struct {
 	bits      int
 	nodes     map[int]*Node
 	sortedIDs []int
+}
+
+type FingerEntry struct {
+	Start  int `json:"start"`
+	NodeID int `json:"node_id"`
+}
+
+type LookupStep struct {
+	FromID      int    `json:"from_id"`
+	ToID        int    `json:"to_id"`
+	Action      string `json:"action"`
+	Description string `json:"description"`
+}
+
+type LookupResult struct {
+	TargetID     int                   `json:"target_id"`
+	OwnerID      int                   `json:"owner_id"`
+	Route        []int                 `json:"route"`
+	Hops         int                   `json:"hops"`
+	Steps        []LookupStep          `json:"steps"`
+	FingerTables map[int][]FingerEntry `json:"finger_tables"`
 }
 
 func NewRing(net *network.Network) (*Ring, error) {
@@ -42,12 +62,10 @@ func NewRing(net *network.Network) (*Ring, error) {
 
 	for i, id := range ids {
 		nextIndex := (i + 1) % size
-		prevIndex := (i - 1 + size) % size
 
 		ring.nodes[id] = &Node{
 			Node:        network.Node{ID: id},
 			Successor:   ids[nextIndex],
-			Predecessor: ids[prevIndex],
 			FingerTable: ring.buildFingerTable(id),
 		}
 	}
@@ -67,11 +85,17 @@ func (r *Ring) Successor(id int) int {
 
 func (r *Ring) buildFingerTable(id int) []int {
 	fingerTable := make([]int, 0, r.bits)
+	size := 1 << r.bits
 
 	for i := 0; i < r.bits; i++ {
-		start := (id + (1 << i)) % (1 << r.bits)
-		fingerTable = append(fingerTable, r.Successor(start))
+		start := (id + (1 << i)) % size
+
+		fingerTable = append(
+			fingerTable,
+			r.Successor(start),
+		)
 	}
+
 	return fingerTable
 }
 
@@ -88,28 +112,64 @@ func inOpenInterval(id, start, end int) bool {
 }
 
 func (r *Ring) ClosestPrecedingFinger(nodeID, targetID int) int {
-	for i := r.bits - 1; i >= 0; i-- {
-		fingerID := r.nodes[nodeID].FingerTable[i]
+	node := r.nodes[nodeID]
+
+	for i := len(node.FingerTable) - 1; i >= 0; i-- {
+		fingerID := node.FingerTable[i]
+
 		if inOpenInterval(fingerID, nodeID, targetID) {
 			return fingerID
 		}
 	}
+
 	return nodeID
 }
 
-type LookupStep struct {
-	FromID      int    `json:"from_id"`
-	ToID        int    `json:"to_id"`
-	Action      string `json:"action"`
-	Description string `json:"description"`
+func (r *Ring) GetFingerTable(nodeID int) ([]FingerEntry, error) {
+	if r == nil {
+		return nil, fmt.Errorf("кольцо не создано")
+	}
+
+	node, ok := r.nodes[nodeID]
+	if !ok {
+		return nil, fmt.Errorf(
+			"узел %d отсутствует в кольце",
+			nodeID,
+		)
+	}
+
+	size := 1 << r.bits
+	table := make([]FingerEntry, len(node.FingerTable))
+
+	for i, fingerID := range node.FingerTable {
+		start := (nodeID + (1 << i)) % size
+
+		table[i] = FingerEntry{
+			Start:  start,
+			NodeID: fingerID,
+		}
+	}
+
+	return table, nil
 }
 
-type LookupResult struct {
-	TargetID int          `json:"target_id"`
-	OwnerID  int          `json:"owner_id"`
-	Route    []int        `json:"route"`
-	Hops     int          `json:"hops"`
-	Steps    []LookupStep `json:"steps"`
+func (r *Ring) FingerTablesSnapshot() (map[int][]FingerEntry, error) {
+	if r == nil {
+		return nil, fmt.Errorf("кольцо не создано")
+	}
+
+	tables := make(map[int][]FingerEntry, len(r.nodes))
+
+	for _, id := range r.sortedIDs {
+		table, err := r.GetFingerTable(id)
+		if err != nil {
+			return nil, err
+		}
+
+		tables[id] = table
+	}
+
+	return tables, nil
 }
 
 func (r *Ring) Lookup(nodeID, targetID int) (LookupResult, error) {
@@ -125,6 +185,7 @@ func (r *Ring) Lookup(nodeID, targetID int) (LookupResult, error) {
 	}
 
 	size := 1 << r.bits
+
 	if targetID < 0 || targetID >= size {
 		return LookupResult{}, fmt.Errorf(
 			"ID %d вне диапазона 0–%d",
@@ -132,12 +193,18 @@ func (r *Ring) Lookup(nodeID, targetID int) (LookupResult, error) {
 		)
 	}
 
+	tables, err := r.FingerTablesSnapshot()
+	if err != nil {
+		return LookupResult{}, err
+	}
+
 	result := LookupResult{
-		TargetID: targetID,
-		OwnerID:  nodeID,
-		Route:    []int{nodeID},
-		Hops:     0,
-		Steps:    []LookupStep{},
+		TargetID:     targetID,
+		OwnerID:      nodeID,
+		Route:        []int{nodeID},
+		Hops:         0,
+		Steps:        []LookupStep{},
+		FingerTables: tables,
 	}
 
 	if len(r.sortedIDs) == 1 {
@@ -197,7 +264,10 @@ func (r *Ring) Lookup(nodeID, targetID int) (LookupResult, error) {
 			return result, nil
 		}
 
-		nextNode := r.ClosestPrecedingFinger(currentNode, targetID)
+		nextNode := r.ClosestPrecedingFinger(
+			currentNode,
+			targetID,
+		)
 
 		var step LookupStep
 
