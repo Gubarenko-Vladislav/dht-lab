@@ -1,96 +1,95 @@
 
 "use strict";
 
+// Вся маршрутизация Chord выполняется на Go.
+// Здесь только ввод параметров, запрос к API и визуализация полученных шагов.
 const SVG_NS = "http://www.w3.org/2000/svg";
-const ID_MIN = 0;
-const ID_MAX = 63;
+const BITS = 6;
+const ID_SPACE = 1 << BITS;
 const DEFAULT_NODES = [4, 8, 14, 21, 32, 38, 42, 48, 51, 56];
 
-// DOM-элементы
-const nodeIdsInput = document.getElementById("node-ids");
-const createNetworkBtn = document.getElementById("create-network");
-const randomNetworkBtn = document.getElementById("random-network");
-const networkSvg = document.getElementById("network-svg");
+const ui = {
+    nodeIds: document.getElementById("node-ids"),
+    createNetwork: document.getElementById("create-network"),
+    randomNetwork: document.getElementById("random-network"),
+    svg: document.getElementById("network-svg"),
+    algorithm: document.getElementById("algorithm"),
+    startNode: document.getElementById("start-node"),
+    targetId: document.getElementById("target-id"),
+    start: document.getElementById("start-btn"),
+    prev: document.getElementById("prev-btn"),
+    next: document.getElementById("next-btn"),
+    reset: document.getElementById("reset-btn"),
+    routing: document.getElementById("routing-table"),
+    description: document.getElementById("step-description"),
+    steps: document.getElementById("steps-list"),
+    result: document.getElementById("search-result"),
+    hops: document.getElementById("hops-count"),
+    requests: document.getElementById("requests-count"),
+    rounds: document.getElementById("rounds-count"),
+};
 
-const algorithmSelect = document.getElementById("algorithm");
-const startNodeInput = document.getElementById("start-node");
-const targetIdInput = document.getElementById("target-id");
-
-const startBtn = document.getElementById("start-btn");
-const prevBtn = document.getElementById("prev-btn");
-const nextBtn = document.getElementById("next-btn");
-const resetBtn = document.getElementById("reset-btn");
-
-const routingTable = document.getElementById("routing-table");
-const stepDescription = document.getElementById("step-description");
-const stepsList = document.getElementById("steps-list");
-const searchResult = document.getElementById("search-result");
-
-const hopsCount = document.getElementById("hops-count");
-const requestsCount = document.getElementById("requests-count");
-const roundsCount = document.getElementById("rounds-count");
-
-// Состояние интерфейса.
-// Алгоритмы поиска будут выполняться на Go.
-let nodes = [...DEFAULT_NODES];
+const state = {
+    nodes: [...DEFAULT_NODES],
+    lookup: null,
+    stepIndex: -1, // -1: ни один шаг ещё не показан.
+    loading: false,
+    controller: null,
+    requestVersion: 0,
+};
 
 // --------------------------------------------------
 // Вспомогательные функции
 // --------------------------------------------------
 
-function createSvgElement(tag, attributes = {}) {
+function svgElement(tag, attributes = {}) {
     const element = document.createElementNS(SVG_NS, tag);
 
-    for (const [name, value] of Object.entries(attributes)) {
-        element.setAttribute(name, String(value));
+    for (const [key, value] of Object.entries(attributes)) {
+        element.setAttribute(key, String(value));
     }
 
     return element;
 }
 
-function addSvgText(parent, x, y, text, attributes = {}) {
-    const element = createSvgElement("text", {
-        x,
-        y,
-        ...attributes
-    });
-
-    // Используем textContent, а не innerHTML.
-    element.textContent = String(text);
+function svgText(parent, x, y, value, attrs = {}) {
+    const element = svgElement("text", { x, y, ...attrs });
+    element.textContent = String(value);
     parent.appendChild(element);
-
     return element;
 }
 
-function addSvgLine(parent, x1, y1, x2, y2, attributes = {}) {
-    const element = createSvgElement("line", {
+function svgLine(parent, x1, y1, x2, y2, attrs = {}) {
+    const element = svgElement("line", {
         x1,
         y1,
         x2,
         y2,
-        ...attributes
+        ...attrs,
     });
 
     parent.appendChild(element);
     return element;
 }
 
-function parseNodeIds(value) {
-    const tokens = value.split(",").map(token => token.trim());
+function parseNodeIds(input) {
+    const parts = input.split(",").map(value => value.trim());
 
-    if (tokens.length === 0 || tokens.some(token => token === "")) {
+    if (parts.length === 0 || parts.some(value => value === "")) {
         throw new Error("Введите ID узлов через запятую.");
     }
 
-    const ids = tokens.map(token => {
-        if (!/^\d+$/.test(token)) {
-            throw new Error(`Некорректный ID узла: ${token}`);
+    const ids = parts.map(value => {
+        if (!/^\d+$/.test(value)) {
+            throw new Error(`Некорректный ID узла: ${value}`);
         }
 
-        const id = Number(token);
+        const id = Number(value);
 
-        if (!Number.isSafeInteger(id) || id < ID_MIN || id > ID_MAX) {
-            throw new Error("ID узлов должны находиться в диапазоне 0–63.");
+        if (!Number.isSafeInteger(id) || id < 0 || id >= ID_SPACE) {
+            throw new Error(
+                `ID узлов должны находиться в диапазоне 0–${ID_SPACE - 1}.`
+            );
         }
 
         return id;
@@ -103,456 +102,668 @@ function parseNodeIds(value) {
     return ids.sort((a, b) => a - b);
 }
 
-function readId(input, label) {
-    const value = input.value.trim();
-
-    if (value === "") {
-        throw new Error(`Укажите ${label}.`);
-    }
-
-    const id = Number(value);
+function readId(input, name) {
+    const raw = input.value.trim();
+    const id = Number(raw);
 
     if (
+        raw === "" ||
         !Number.isInteger(id) ||
-        id < ID_MIN ||
-        id > ID_MAX
+        id < 0 ||
+        id >= ID_SPACE
     ) {
-        throw new Error(`${label}: допустимый диапазон — 0–63.`);
+        throw new Error(
+            `${name}: укажите целое число от 0 до ${ID_SPACE - 1}.`
+        );
     }
 
     return id;
 }
 
-function getStartId() {
+function optionalId(input) {
     try {
-        return readId(startNodeInput, "начальный ID");
+        return readId(input, "ID");
     } catch {
         return null;
     }
 }
 
-function getTargetId() {
-    try {
-        return readId(targetIdInput, "целевой ID");
-    } catch {
-        return null;
+function showMessage(description, result = null) {
+    ui.description.textContent = description;
+
+    if (result !== null) {
+        ui.result.textContent = result;
     }
 }
 
-function setMessage(message, resultMessage = null) {
-    stepDescription.textContent = message;
+function updateButtons() {
+    const steps = state.lookup?.steps ?? [];
 
-    if (resultMessage !== null) {
-        searchResult.textContent = resultMessage;
+    ui.start.disabled = state.loading;
+
+    ui.prev.disabled =
+        state.loading ||
+        !state.lookup ||
+        state.stepIndex < 0;
+
+    ui.next.disabled =
+        state.loading ||
+        !state.lookup ||
+        state.stepIndex >= steps.length - 1;
+}
+
+function cancelRequest() {
+    state.requestVersion++;
+
+    if (state.controller) {
+        state.controller.abort();
     }
+
+    state.controller = null;
+    state.loading = false;
 }
 
-function clearSimulationResults() {
-    hopsCount.textContent = "0";
-    requestsCount.textContent = "0";
-    roundsCount.textContent = "0";
+function clearSimulation(
+    description = "Сеть готова. Выберите алгоритм и параметры поиска."
+) {
+    cancelRequest();
 
-    stepsList.replaceChildren();
+    state.lookup = null;
+    state.stepIndex = -1;
 
-    prevBtn.disabled = true;
-    nextBtn.disabled = true;
-}
+    ui.steps.replaceChildren();
 
-function clearSvg() {
-    networkSvg.replaceChildren();
-}
+    ui.hops.textContent = "0";
 
-function resetSimulation() {
-    clearSimulationResults();
-    updateRoutingPlaceholder();
+    // Эти метрики сервер пока не возвращает.
+    ui.requests.textContent = "—";
+    ui.rounds.textContent = "—";
 
-    setMessage(
-        "Симуляция сброшена. Сеть и параметры сохранены.",
-        "Поиск ещё не выполнялся."
-    );
+    showMessage(description, "Поиск ещё не выполнялся.");
 
+    renderRouting();
     renderNetwork();
+    updateButtons();
 }
 
 // --------------------------------------------------
-// Визуализация Chord
+// Таблица маршрутизации
 // --------------------------------------------------
 
-function renderChordNetwork() {
-    clearSvg();
+function renderRouting() {
+    ui.routing.replaceChildren();
 
-    const width = 800;
-    const height = 450;
-    const centerX = width / 2;
-    const centerY = height / 2;
-    const ringRadius = 140;
-    const nodeRadius = 140;
-    const labelRadius = 165;
+    const note = document.createElement("p");
 
-    const startId = getStartId();
-    const targetId = getTargetId();
-
-    // Окружность ID-пространства.
-    networkSvg.appendChild(createSvgElement("circle", {
-        cx: centerX,
-        cy: centerY,
-        r: ringRadius,
-        fill: "none",
-        stroke: "#354158",
-        "stroke-width": 2
-    }));
-
-    // Отметки ID от 0 до 63.
-    for (let id = 0; id < 64; id++) {
-        const angle = (id / 64) * Math.PI * 2 - Math.PI / 2;
-
-        const innerRadius = id % 8 === 0 ? 143 : 146;
-        const outerRadius = id % 8 === 0 ? 153 : 150;
-
-        const x1 = centerX + Math.cos(angle) * innerRadius;
-        const y1 = centerY + Math.sin(angle) * innerRadius;
-        const x2 = centerX + Math.cos(angle) * outerRadius;
-        const y2 = centerY + Math.sin(angle) * outerRadius;
-
-        addSvgLine(networkSvg, x1, y1, x2, y2, {
-            stroke: id % 8 === 0 ? "#8292ad" : "#354158",
-            "stroke-width": id % 8 === 0 ? 1.5 : 0.8
-        });
+    if (ui.algorithm.value === "kademlia") {
+        note.textContent =
+            "k-buckets появятся после реализации Kademlia на Go.";
+    } else if (!state.lookup || state.stepIndex < 0) {
+        note.textContent =
+            "Finger Table пока не передаётся через Go API. " +
+            "После запуска поиска здесь будут видны решения маршрутизации.";
+    } else {
+        note.textContent =
+            "Выполненные решения Chord (это ещё не полная Finger Table):";
     }
 
-    // Подписи на главных делениях кольца.
-    for (let id = 0; id < 64; id += 8) {
-        const angle = (id / 64) * Math.PI * 2 - Math.PI / 2;
-        const labelX = centerX + Math.cos(angle) * 187;
-        const labelY = centerY + Math.sin(angle) * 187;
+    ui.routing.appendChild(note);
 
-        addSvgText(networkSvg, labelX, labelY, id, {
-            "text-anchor": "middle",
-            "dominant-baseline": "middle",
-            "font-size": 12
-        });
+    if (!state.lookup || state.stepIndex < 0) {
+        return;
     }
 
-    // Центральная подпись.
-    addSvgText(networkSvg, centerX, centerY - 20, "CHORD", {
-        "text-anchor": "middle",
-        "font-size": 18,
-        "font-weight": 700
-    }).style.fill = "#e8eef8";
+    const table = document.createElement("table");
+    const head = document.createElement("thead");
+    const headerRow = document.createElement("tr");
 
-    addSvgText(networkSvg, centerX, centerY + 4, "6-bit ID space", {
-        "text-anchor": "middle",
-        "font-size": 12
-    });
+    for (const title of ["От узла", "К узлу", "Действие"]) {
+        const cell = document.createElement("th");
+        cell.textContent = title;
+        headerRow.appendChild(cell);
+    }
 
-    addSvgText(
-        networkSvg,
-        centerX,
-        centerY + 25,
-        `Узлов: ${nodes.length}`,
-        {
-            "text-anchor": "middle",
-            "font-size": 12
+    head.appendChild(headerRow);
+    table.appendChild(head);
+
+    const body = document.createElement("tbody");
+
+    for (
+        const step of state.lookup.steps.slice(0, state.stepIndex + 1)
+    ) {
+        const row = document.createElement("tr");
+
+        for (const value of [
+            step.from_id,
+            step.to_id,
+            step.action,
+        ]) {
+            const cell = document.createElement("td");
+            cell.textContent = String(value);
+            row.appendChild(cell);
         }
-    );
 
-    // Целевой ID может не принадлежать сети.
-    if (targetId !== null) {
-        const angle = (targetId / 64) * Math.PI * 2 - Math.PI / 2;
+        body.appendChild(row);
+    }
 
-        const x = centerX + Math.cos(angle) * ringRadius;
-        const y = centerY + Math.sin(angle) * ringRadius;
+    table.appendChild(body);
+    ui.routing.appendChild(table);
+}
 
-        networkSvg.appendChild(createSvgElement("circle", {
-            cx: x,
-            cy: y,
-            r: 11,
-            fill: "none",
-            stroke: "#f6ad55",
-            "stroke-width": 2,
-            "stroke-dasharray": "3 3"
+// --------------------------------------------------
+// CHORD: визуализация кольца
+// --------------------------------------------------
+
+function chordPosition(id, radius = 140) {
+    const angle =
+        (id / ID_SPACE) * Math.PI * 2 - Math.PI / 2;
+
+    return {
+        x: 400 + Math.cos(angle) * radius,
+        y: 220 + Math.sin(angle) * radius,
+    };
+}
+
+function addArrowMarkers() {
+    const defs = svgElement("defs");
+
+    for (const [id, color] of [
+        ["route-previous", "#64748b"],
+        ["route-active", "#63b3ed"],
+    ]) {
+        const marker = svgElement("marker", {
+            id,
+            markerWidth: 7,
+            markerHeight: 7,
+            refX: 6,
+            refY: 3.5,
+            orient: "auto",
+        });
+
+        marker.appendChild(svgElement("path", {
+            d: "M0 0 L7 3.5 L0 7 Z",
+            fill: color,
         }));
 
-        const marker = createSvgElement("circle", {
-            cx: x,
-            cy: y,
-            r: 4,
-            fill: "#f6ad55"
-        });
-
-        const title = createSvgElement("title");
-        title.textContent = `Target ID: ${targetId}`;
-        marker.appendChild(title);
-
-        networkSvg.appendChild(marker);
+        defs.appendChild(marker);
     }
 
-    // Отрисовка виртуальных узлов.
-    for (const id of nodes) {
-        const angle = (id / 64) * Math.PI * 2 - Math.PI / 2;
+    ui.svg.appendChild(defs);
+}
 
-        const x = centerX + Math.cos(angle) * nodeRadius;
-        const y = centerY + Math.sin(angle) * nodeRadius;
+function renderChord() {
+    ui.svg.replaceChildren();
+    addArrowMarkers();
 
-        const labelX = centerX + Math.cos(angle) * labelRadius;
-        const labelY = centerY + Math.sin(angle) * labelRadius;
+    // Основное кольцо.
+    ui.svg.appendChild(svgElement("circle", {
+        cx: 400,
+        cy: 220,
+        r: 140,
+        fill: "none",
+        stroke: "#354158",
+        "stroke-width": 2,
+    }));
 
-        const isStart = id === startId;
+    // Отметки ID-пространства.
+    for (let id = 0; id < ID_SPACE; id++) {
+        const inner = chordPosition(
+            id,
+            id % 8 === 0 ? 145 : 147
+        );
 
-        const node = createSvgElement("circle", {
-            cx: x,
-            cy: y,
-            r: isStart ? 9 : 6,
-            stroke: isStart ? "#e8f6ff" : "#a7b4c9",
-            "stroke-width": isStart ? 2.5 : 1.5
-        });
+        const outer = chordPosition(
+            id,
+            id % 8 === 0 ? 154 : 151
+        );
 
-        node.style.fill = isStart ? "#63b3ed" : "#8292ad";
+        svgLine(
+            ui.svg,
+            inner.x,
+            inner.y,
+            outer.x,
+            outer.y,
+            {
+                stroke: id % 8 === 0 ? "#8292ad" : "#354158",
+                "stroke-width": id % 8 === 0 ? 1.4 : 0.8,
+            }
+        );
+    }
 
-        const title = createSvgElement("title");
-        title.textContent = isStart
-            ? `Узел ${id}: начальный узел`
-            : `Узел ${id}`;
+    // Подписи главных делений.
+    for (let id = 0; id < ID_SPACE; id += 8) {
+        const p = chordPosition(id, 184);
 
-        node.appendChild(title);
-        networkSvg.appendChild(node);
-
-        const label = addSvgText(networkSvg, labelX, labelY, id, {
+        svgText(ui.svg, p.x, p.y, id, {
             "text-anchor": "middle",
             "dominant-baseline": "middle",
             "font-size": 12,
-            "font-weight": isStart ? 700 : 500
+        });
+    }
+
+    // Центральная информация.
+    svgText(ui.svg, 400, 205, "CHORD", {
+        "text-anchor": "middle",
+        "font-weight": 700,
+        "font-size": 18,
+    }).style.fill = "#e8eef8";
+
+    svgText(ui.svg, 400, 226, `ID: 0–${ID_SPACE - 1}`, {
+        "text-anchor": "middle",
+        "font-size": 12,
+    });
+
+    svgText(ui.svg, 400, 246, `Узлов: ${state.nodes.length}`, {
+        "text-anchor": "middle",
+        "font-size": 12,
+    });
+
+    const target = optionalId(ui.targetId);
+    const start = optionalId(ui.startNode);
+
+    // Целевой ключ.
+    if (target !== null) {
+        const p = chordPosition(target);
+
+        ui.svg.appendChild(svgElement("circle", {
+            cx: p.x,
+            cy: p.y,
+            r: 13,
+            fill: "none",
+            stroke: "#f6ad55",
+            "stroke-width": 2,
+            "stroke-dasharray": "4 3",
+        }));
+
+        const marker = svgElement("circle", {
+            cx: p.x,
+            cy: p.y,
+            r: 4,
+            fill: "#f6ad55",
         });
 
-        label.style.fill = isStart ? "#63b3ed" : "#c4cede";
+        const title = svgElement("title");
+        title.textContent = `Целевой ключ ${target}`;
+
+        marker.appendChild(title);
+        ui.svg.appendChild(marker);
+    }
+
+    // Берём только те шаги, которые уже показаны пользователю.
+    const visibleSteps = state.lookup
+        ? state.lookup.steps.slice(0, state.stepIndex + 1)
+        : [];
+
+    // Рисуем переходы, полученные от Go.
+    visibleSteps.forEach((step, index) => {
+        if (step.from_id === step.to_id) {
+            return;
+        }
+
+        const a = chordPosition(step.from_id);
+        const b = chordPosition(step.to_id);
+
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+
+        const distance = Math.hypot(dx, dy) || 1;
+        const ux = dx / distance;
+        const uy = dy / distance;
+
+        const startX = a.x + ux * 13;
+        const startY = a.y + uy * 13;
+
+        const endX = b.x - ux * 13;
+        const endY = b.y - uy * 13;
+
+        const bend = Math.min(distance * 0.13, 35);
+
+        const controlX =
+            (startX + endX) / 2 - uy * bend;
+
+        const controlY =
+            (startY + endY) / 2 + ux * bend;
+
+        const active = index === state.stepIndex;
+
+        const path = svgElement("path", {
+            d:
+                `M ${startX} ${startY} ` +
+                `Q ${controlX} ${controlY} ${endX} ${endY}`,
+            fill: "none",
+            stroke: active ? "#63b3ed" : "#64748b",
+            "stroke-width": active ? 3.5 : 2,
+            "stroke-linecap": "round",
+            "marker-end": active
+                ? "url(#route-active)"
+                : "url(#route-previous)",
+            opacity: active ? 1 : 0.7,
+        });
+
+        ui.svg.appendChild(path);
+    });
+
+    // Текущий шаг.
+    const activeStep = state.stepIndex >= 0
+        ? state.lookup?.steps[state.stepIndex]
+        : null;
+
+    const activeNode = activeStep
+        ? activeStep.to_id
+        : start;
+
+    const atEnd =
+        state.lookup &&
+        state.stepIndex === state.lookup.steps.length - 1;
+
+    // Узлы сети.
+    for (const id of state.nodes) {
+        const p = chordPosition(id);
+
+        const isStart = id === start;
+        const isActive = id === activeNode;
+
+        const isOwner = Boolean(
+            atEnd && id === state.lookup.owner_id
+        );
+
+        const circle = svgElement("circle", {
+            cx: p.x,
+            cy: p.y,
+            r: isActive ? 10 : 7,
+            fill: isOwner
+                ? "#68d391"
+                : isActive
+                    ? "#63b3ed"
+                    : "#8292ad",
+            stroke: isActive ? "#e8f6ff" : "#a7b4c9",
+            "stroke-width": isActive ? 2.5 : 1.4,
+        });
+
+        const title = svgElement("title");
+
+        title.textContent =
+            `Узел ${id}` +
+            (isStart ? " — старт" : "") +
+            (isOwner ? " — владелец" : "");
+
+        circle.appendChild(title);
+        ui.svg.appendChild(circle);
+
+        // Подпись узла.
+        const labelPos = chordPosition(id, 166);
+
+        const label = svgText(
+            ui.svg,
+            labelPos.x,
+            labelPos.y,
+            id,
+            {
+                "text-anchor": "middle",
+                "dominant-baseline": "middle",
+                "font-size": 12,
+                "font-weight": isActive ? 700 : 500,
+            }
+        );
+
+        label.style.fill = isOwner
+            ? "#68d391"
+            : isActive
+                ? "#63b3ed"
+                : "#c4cede";
     }
 
     // Легенда.
-    addSvgText(networkSvg, 24, 425, "● Начальный узел", {
-        "font-size": 12
-    }).style.fill = "#63b3ed";
+    svgText(
+        ui.svg,
+        24,
+        423,
+        "● Старт / активный узел",
+        { "font-size": 12 }
+    ).style.fill = "#63b3ed";
 
-    addSvgText(networkSvg, 205, 425, "◎ Целевой ID", {
-        "font-size": 12
-    }).style.fill = "#f6ad55";
+    svgText(
+        ui.svg,
+        260,
+        423,
+        "◎ Целевой ключ",
+        { "font-size": 12 }
+    ).style.fill = "#f6ad55";
 
-    networkSvg.setAttribute(
+    ui.svg.setAttribute(
         "aria-label",
-        `Кольцо Chord. Узлов: ${nodes.length}. ` +
-        `Старт: ${startId ?? "не задан"}. ` +
-        `Цель: ${targetId ?? "не задан"}.`
+        `Chord: кольцо из ${state.nodes.length} узлов, ` +
+        `цель ${target ?? "не задана"}`
     );
 }
 
 // --------------------------------------------------
-// Визуализация Kademlia
+// KADEMLIA: визуализация XOR-расстояний
 // --------------------------------------------------
 
-function renderKademliaDistanceMap() {
-    clearSvg();
+// Здесь только визуализация расстояний.
+// Алгоритм поиска Kademlia в JavaScript не реализуется.
 
-    const width = 800;
-    const height = 450;
+function renderKademlia() {
+    ui.svg.replaceChildren();
 
-    const left = 60;
-    const right = 755;
-    const axisY = 325;
-
-    const targetId = getTargetId();
-    const startId = getStartId();
-
-    addSvgText(networkSvg, 24, 30, "KADEMLIA", {
-        "font-size": 18,
-        "font-weight": 700
-    }).style.fill = "#e8eef8";
-
-    addSvgText(
-        networkSvg,
+    svgText(
+        ui.svg,
         24,
-        52,
-        "Узлы расположены по XOR-расстоянию до целевого ID",
+        32,
+        "KADEMLIA · XOR DISTANCE",
+        {
+            "font-size": 17,
+            "font-weight": 700,
+        }
+    ).style.fill = "#e8eef8";
+
+    svgText(
+        ui.svg,
+        24,
+        56,
+        "Визуальная карта расстояний — не маршрут поиска",
         { "font-size": 12 }
     );
 
-    if (targetId === null) {
-        addSvgText(
-            networkSvg,
-            width / 2,
-            height / 2,
+    const target = optionalId(ui.targetId);
+    const start = optionalId(ui.startNode);
+
+    if (target === null) {
+        svgText(
+            ui.svg,
+            400,
+            220,
             "Укажите целевой ID",
-            { "text-anchor": "middle", "font-size": 14 }
+            {
+                "text-anchor": "middle",
+                "font-size": 14,
+            }
         );
 
         return;
     }
 
-    // Для шестибитных ID: distance = nodeID XOR targetID.
-    // Минимальное расстояние — 0, максимальное — 63.
-    const xForDistance = distance =>
-        left + (distance / 63) * (right - left);
+    const left = 70;
+    const right = 750;
+    const axisY = 330;
 
-    // Горизонтальная ось XOR-расстояний.
-    addSvgLine(networkSvg, left, axisY, right, axisY, {
-        stroke: "#52627b",
-        "stroke-width": 1.5
-    });
+    const xFor = distance =>
+        left +
+        (distance / (ID_SPACE - 1)) * (right - left);
 
-    // Деления шкалы.
-    for (let distance = 0; distance <= 63; distance += 7) {
-        const x = xForDistance(distance);
+    // Шкала расстояний.
+    svgLine(
+        ui.svg,
+        left,
+        axisY,
+        right,
+        axisY,
+        {
+            stroke: "#71829e",
+            "stroke-width": 1.5,
+        }
+    );
 
-        addSvgLine(
-            networkSvg,
+    for (
+        let distance = 0;
+        distance < ID_SPACE;
+        distance += 8
+    ) {
+        const x = xFor(distance);
+
+        svgLine(
+            ui.svg,
             x,
             axisY - 6,
             x,
             axisY + 6,
             {
                 stroke: "#71829e",
-                "stroke-width": 1
             }
         );
 
-        addSvgText(
-            networkSvg,
+        svgText(
+            ui.svg,
             x,
-            axisY + 22,
+            axisY + 24,
             distance,
             {
                 "text-anchor": "middle",
-                "font-size": 10
+                "font-size": 11,
             }
         );
     }
 
-    // Отдельная отметка максимального расстояния.
-    addSvgText(
-        networkSvg,
-        xForDistance(63),
-        axisY + 22,
-        "63",
-        { "text-anchor": "middle", "font-size": 10 }
-    );
-
-    // Цель соответствует расстоянию 0.
-    const targetX = xForDistance(0);
-
-    addSvgLine(
-        networkSvg,
-        targetX,
-        75,
-        targetX,
-        axisY,
+    svgText(
+        ui.svg,
+        xFor(ID_SPACE - 1),
+        axisY + 24,
+        ID_SPACE - 1,
         {
-            stroke: "#f6ad55",
-            "stroke-width": 1.5,
-            "stroke-dasharray": "5 4"
+            "text-anchor": "middle",
+            "font-size": 11,
         }
     );
 
-    addSvgText(
-        networkSvg,
-        targetX + 5,
-        72,
-        `Target ${targetId}`,
-        { "font-size": 11, "font-weight": 700 }
+    // Цель находится на расстоянии XOR = 0.
+    svgLine(
+        ui.svg,
+        left,
+        90,
+        left,
+        axisY,
+        {
+            stroke: "#f6ad55",
+            "stroke-dasharray": "5 4",
+        }
+    );
+
+    svgText(
+        ui.svg,
+        left + 8,
+        84,
+        `Target ${target}`,
+        {
+            "font-weight": 700,
+            "font-size": 12,
+        }
     ).style.fill = "#f6ad55";
 
-    // Сортировка по реальному XOR-расстоянию.
-    const sortedNodes = nodes
+    // XOR используется только для размещения узлов на карте.
+    const sorted = state.nodes
         .map(id => ({
             id,
-            distance: id ^ targetId
+            distance: id ^ target,
         }))
         .sort((a, b) => a.distance - b.distance);
 
-    // Четыре визуальных ряда уменьшают наложение подписей.
-    const laneY = [112, 166, 220, 274];
+    const lanes = [112, 162, 212, 262];
+    const lastX = lanes.map(() => -Infinity);
 
-    sortedNodes.forEach((item, index) => {
-        const x = xForDistance(item.distance);
-        const y = laneY[index % laneY.length];
-        const isStart = item.id === startId;
+    for (const item of sorted) {
+        const x = xFor(item.distance);
 
-        // Соединяем точку узла со шкалой.
-        addSvgLine(
-            networkSvg,
+        let lane = lastX.findIndex(
+            previousX => x - previousX >= 50
+        );
+
+        if (lane === -1) {
+            lane = lastX.indexOf(Math.min(...lastX));
+        }
+
+        lastX[lane] = x;
+
+        const y = lanes[lane];
+        const isStart = item.id === start;
+
+        svgLine(
+            ui.svg,
             x,
             y + 9,
             x,
             axisY - 5,
             {
                 stroke: isStart ? "#63b3ed" : "#354158",
-                "stroke-width": isStart ? 1.8 : 1
+                "stroke-width": isStart ? 1.8 : 1,
             }
         );
 
-        const node = createSvgElement("circle", {
+        const node = svgElement("circle", {
             cx: x,
             cy: y,
             r: isStart ? 8 : 6,
+            fill: isStart ? "#63b3ed" : "#8292ad",
             stroke: isStart ? "#e8f6ff" : "#a7b4c9",
-            "stroke-width": isStart ? 2 : 1
         });
 
-        node.style.fill = isStart ? "#63b3ed" : "#8292ad";
+        const tooltip = svgElement("title");
 
-        const title = createSvgElement("title");
-        title.textContent =
-            `Узел ${item.id}; XOR-расстояние: ${item.distance}`;
+        tooltip.textContent =
+            `Узел ${item.id}, ` +
+            `расстояние XOR: ${item.distance}`;
 
-        node.appendChild(title);
-        networkSvg.appendChild(node);
+        node.appendChild(tooltip);
+        ui.svg.appendChild(node);
 
-        const idLabel = addSvgText(
-            networkSvg,
+        // ID узла.
+        svgText(
+            ui.svg,
             x,
-            y - 13,
+            y - 14,
             item.id,
             {
                 "text-anchor": "middle",
                 "font-size": 12,
-                "font-weight": isStart ? 700 : 500
+                "font-weight": isStart ? 700 : 500,
             }
-        );
+        ).style.fill = isStart ? "#63b3ed" : "#c4cede";
 
-        idLabel.style.fill = isStart ? "#63b3ed" : "#d4dbea";
-
-        const distanceLabel = addSvgText(
-            networkSvg,
+        // XOR-расстояние.
+        svgText(
+            ui.svg,
             x,
             y + 22,
             `d=${item.distance}`,
             {
                 "text-anchor": "middle",
-                "font-size": 10
+                "font-size": 10,
             }
         );
+    }
 
-        distanceLabel.style.fill = "#91a0b8";
-    });
-
-    // Легенда и пояснение.
-    addSvgText(networkSvg, 24, 395, "● Начальный узел", {
-        "font-size": 12
-    }).style.fill = "#63b3ed";
-
-    addSvgText(networkSvg, 205, 395, "│ Целевой ID", {
-        "font-size": 12
-    }).style.fill = "#f6ad55";
-
-    addSvgText(
-        networkSvg,
+    svgText(
+        ui.svg,
         24,
-        423,
-        "d = nodeID XOR targetID. Меньшее d означает меньшую XOR-дистанцию.",
-        { "font-size": 11 }
+        410,
+        "d = nodeID XOR targetID · Меньше d — ближе по XOR",
+        { "font-size": 12 }
     );
 
-    networkSvg.setAttribute(
+    ui.svg.setAttribute(
         "aria-label",
-        `Карта XOR-расстояний Kademlia. Цель ${targetId}. ` +
-        `Узлов: ${nodes.length}.`
+        `Kademlia: XOR-расстояния ${state.nodes.length} ` +
+        `узлов до ID ${target}`
     );
 }
 
@@ -561,29 +772,269 @@ function renderKademliaDistanceMap() {
 // --------------------------------------------------
 
 function renderNetwork() {
-    if (algorithmSelect.value === "kademlia") {
-        renderKademliaDistanceMap();
+    if (ui.algorithm.value === "kademlia") {
+        renderKademlia();
     } else {
-        renderChordNetwork();
+        renderChord();
     }
 }
 
 // --------------------------------------------------
-// Таблица маршрутизации
+// Пошаговая визуализация результатов Go
 // --------------------------------------------------
 
-function updateRoutingPlaceholder() {
-    const description = document.createElement("p");
+function renderSimulationStep() {
+    ui.steps.replaceChildren();
 
-    if (algorithmSelect.value === "chord") {
-        description.textContent =
-            "Finger Table появится после подключения Go API.";
-    } else {
-        description.textContent =
-            "k-buckets и XOR-расстояния появятся после подключения Go API.";
+    if (!state.lookup) {
+        updateButtons();
+        return;
     }
 
-    routingTable.replaceChildren(description);
+    const {
+        steps,
+        route,
+        hops,
+        owner_id: ownerId,
+        target_id: targetId,
+    } = state.lookup;
+
+    // Результат получен, но пользователь ещё
+    // не начал просматривать шаги.
+    if (state.stepIndex < 0) {
+        showMessage(
+            `Go выполнил поиск Chord от узла ${route[0]} ` +
+            `для ключа ${targetId}. ` +
+            "Нажмите «Следующий шаг», чтобы начать просмотр.",
+            "Маршрут пока не показан."
+        );
+
+        ui.hops.textContent = "0";
+    } else {
+        // Формируем список уже показанных шагов.
+        for (let i = 0; i <= state.stepIndex; i++) {
+            const step = steps[i];
+
+            const li = document.createElement("li");
+
+            li.textContent =
+                `${step.from_id} → ${step.to_id} ` +
+                `(${step.action}): ${step.description}`;
+
+            if (i === state.stepIndex) {
+                li.classList.add("active");
+            }
+
+            ui.steps.appendChild(li);
+        }
+
+        const currentStep = steps[state.stepIndex];
+
+        const completed =
+            state.stepIndex === steps.length - 1;
+
+        // Количество реально показанных переходов.
+        const traversed = steps
+            .slice(0, state.stepIndex + 1)
+            .filter(step => step.from_id !== step.to_id)
+            .length;
+
+        ui.hops.textContent = String(
+            completed ? hops : traversed
+        );
+
+        ui.description.textContent =
+            `Шаг ${state.stepIndex + 1} из ${steps.length}. ` +
+            currentStep.description;
+
+        if (completed) {
+            ui.result.textContent =
+                `Поиск завершён. ` +
+                `Владелец ключа ${targetId}: узел ${ownerId}. ` +
+                `Маршрут: ${route.join(" → ")}. ` +
+                `Переходов: ${hops}.`;
+        } else {
+            ui.result.textContent =
+                `Показано переходов: ${traversed}. ` +
+                "Поиск продолжается.";
+        }
+    }
+
+    renderRouting();
+    renderNetwork();
+    updateButtons();
+}
+
+// --------------------------------------------------
+// Проверка результата Go API
+// --------------------------------------------------
+
+function requireLookupPayload(payload) {
+    const lookup = payload?.chord;
+
+    if (payload?.algorithm !== "chord" || !lookup) {
+        throw new Error(
+            "Сервер вернул неожиданный формат результата Chord."
+        );
+    }
+
+    if (
+        !Array.isArray(lookup.route) ||
+        !Array.isArray(lookup.steps) ||
+        !Number.isInteger(lookup.owner_id) ||
+        !Number.isInteger(lookup.hops) ||
+        !Number.isInteger(lookup.target_id) ||
+        !lookup.steps.every(step =>
+            Number.isInteger(step.from_id) &&
+            Number.isInteger(step.to_id) &&
+            typeof step.action === "string" &&
+            typeof step.description === "string"
+        )
+    ) {
+        throw new Error(
+            "Ответ Go API не содержит корректный маршрут или шаги."
+        );
+    }
+
+    return lookup;
+}
+
+// --------------------------------------------------
+// Запуск симуляции через Go API
+// --------------------------------------------------
+
+async function startSimulation() {
+    let ids;
+    let startNode;
+    let targetId;
+
+    // Сначала проверяем данные пользователя.
+    try {
+        ids = parseNodeIds(ui.nodeIds.value);
+
+        startNode = readId(
+            ui.startNode,
+            "Начальный узел"
+        );
+
+        targetId = readId(
+            ui.targetId,
+            "Целевой ID"
+        );
+
+        if (!ids.includes(startNode)) {
+            throw new Error(
+                `Начальный узел ${startNode} отсутствует в сети.`
+            );
+        }
+    } catch (error) {
+        clearSimulation(error.message);
+        return;
+    }
+
+    state.nodes = ids;
+    clearSimulation();
+
+    // Kademlia пока не реализована на Go.
+    if (ui.algorithm.value !== "chord") {
+        showMessage(
+            "Поиск Kademlia пока не реализован на Go. " +
+            "Сейчас доступна только карта XOR-расстояний.",
+            "Результата поиска Kademlia пока нет."
+        );
+
+        return;
+    }
+
+    // Идентификатор запроса защищает от устаревших ответов.
+    const version = ++state.requestVersion;
+
+    const controller = new AbortController();
+    state.controller = controller;
+
+    state.loading = true;
+    updateButtons();
+
+    showMessage(
+        "Выполняется поиск Chord на Go...",
+        "Ожидается результат HTTP API."
+    );
+
+    try {
+        // Настоящий HTTP-запрос к твоему Go-бэкенду.
+        const response = await fetch("/api/lookup", {
+            method: "POST",
+
+            headers: {
+                "Content-Type": "application/json",
+            },
+
+            body: JSON.stringify({
+                algorithm: "chord",
+                bits: BITS,
+                nodes: ids,
+                start_node: startNode,
+                target_id: targetId,
+            }),
+
+            signal: controller.signal,
+        });
+
+        const contentType =
+            response.headers.get("content-type") || "";
+
+        // Go может вернуть как JSON, так и текст ошибки.
+        const data = contentType.includes("application/json")
+            ? await response.json()
+            : await response.text();
+
+        if (version !== state.requestVersion) {
+            return;
+        }
+
+        if (!response.ok) {
+            const reason = typeof data === "string"
+                ? data.trim()
+                : data?.error || `HTTP ${response.status}`;
+
+            throw new Error(
+                reason || `HTTP ${response.status}`
+            );
+        }
+
+        // Результат вычислен Go.
+        state.lookup = requireLookupPayload(data);
+
+        // Начинаем с нулевого состояния визуализации.
+        state.stepIndex = -1;
+
+        renderSimulationStep();
+
+    } catch (error) {
+        if (
+            version !== state.requestVersion ||
+            error.name === "AbortError"
+        ) {
+            return;
+        }
+
+        state.lookup = null;
+
+        showMessage(
+            `Ошибка поиска: ${error.message}`,
+            "Поиск не выполнен."
+        );
+
+        renderRouting();
+        renderNetwork();
+
+    } finally {
+        if (version === state.requestVersion) {
+            state.controller = null;
+            state.loading = false;
+            updateButtons();
+        }
+    }
 }
 
 // --------------------------------------------------
@@ -591,170 +1042,141 @@ function updateRoutingPlaceholder() {
 // --------------------------------------------------
 
 function createNetwork() {
-    let parsedNodes;
-
     try {
-        parsedNodes = parseNodeIds(nodeIdsInput.value);
+        state.nodes = parseNodeIds(ui.nodeIds.value);
+
+        ui.nodeIds.value = state.nodes.join(", ");
+
+        clearSimulation(
+            `Создана сеть из ${state.nodes.length} узлов.`
+        );
+
     } catch (error) {
-        setMessage(error.message, "Сеть не изменена.");
-        return;
+        clearSimulation(error.message);
     }
-
-    nodes = parsedNodes;
-
-    clearSimulationResults();
-    updateRoutingPlaceholder();
-    renderNetwork();
-
-    const startId = getStartId();
-
-    if (startId === null) {
-        setMessage(
-            `Создана сеть из ${nodes.length} узлов. ` +
-            "Укажите начальный ID.",
-            "Поиск ещё не выполнялся."
-        );
-        return;
-    }
-
-    if (!nodes.includes(startId)) {
-        setMessage(
-            `Создана сеть из ${nodes.length} узлов, но узел ${startId} ` +
-            "отсутствует в ней. Выберите существующий узел.",
-            "Поиск ещё не выполнялся."
-        );
-        return;
-    }
-
-    setMessage(
-        `Сеть создана: ${nodes.length} узлов. ` +
-        "Настройте параметры поиска.",
-        "Поиск ещё не выполнялся."
-    );
 }
 
-function generateRandomNetwork() {
-    const generated = new Set();
+// --------------------------------------------------
+// Генерация случайной сети
+// --------------------------------------------------
 
-    while (generated.size < 10) {
-        generated.add(
-            Math.floor(Math.random() * (ID_MAX + 1))
+function randomNetwork() {
+    const ids = new Set();
+
+    // Генерируем 10 уникальных ID.
+    while (ids.size < 10) {
+        ids.add(
+            Math.floor(Math.random() * ID_SPACE)
         );
     }
 
-    nodes = [...generated].sort((a, b) => a - b);
+    state.nodes = [...ids].sort((a, b) => a - b);
 
-    nodeIdsInput.value = nodes.join(", ");
+    ui.nodeIds.value = state.nodes.join(", ");
 
-    const randomStartIndex = Math.floor(
-        Math.random() * nodes.length
+    // Выбираем существующий стартовый узел.
+    const randomIndex = Math.floor(
+        Math.random() * state.nodes.length
     );
 
-    startNodeInput.value = String(nodes[randomStartIndex]);
+    ui.startNode.value = String(
+        state.nodes[randomIndex]
+    );
 
-    clearSimulationResults();
-    updateRoutingPlaceholder();
-    renderNetwork();
-
-    setMessage(
-        `Сгенерирована сеть из ${nodes.length} узлов. ` +
-        "Выберите целевой ID и запустите поиск.",
-        "Поиск ещё не выполнялся."
+    clearSimulation(
+        `Сгенерирована сеть из ${state.nodes.length} узлов.`
     );
 }
 
 // --------------------------------------------------
-// Запуск поиска
+// Обработчики событий
 // --------------------------------------------------
 
-function startSimulation() {
-    const startId = getStartId();
-    const targetId = getTargetId();
-
-    if (nodes.length === 0) {
-        setMessage("Сначала создайте сеть.");
-        return;
-    }
-
-    if (startId === null || targetId === null) {
-        setMessage("Укажите корректные начальный и целевой ID.");
-        return;
-    }
-
-    if (!nodes.includes(startId)) {
-        setMessage(
-            `Начальный узел ${startId} отсутствует в сети. ` +
-            "Выберите существующий узел."
-        );
-        return;
-    }
-
-    // Здесь пока не выполняется поиск.
-    // Настоящий маршрут, шаги и метрики должен возвращать Go API.
-    clearSimulationResults();
-
-    const algorithmName = algorithmSelect.value === "chord"
-        ? "Chord"
-        : "Kademlia";
-
-    setMessage(
-        `Параметры приняты: ${algorithmName}, старт ${startId}, ` +
-        `цель ${targetId}. Go API симуляции ещё не подключён.`,
-        "Маршрут не рассчитывался."
-    );
-}
-
-// --------------------------------------------------
-// События интерфейса
-// --------------------------------------------------
-
-createNetworkBtn.addEventListener("click", createNetwork);
-
-randomNetworkBtn.addEventListener(
+// Создать сеть.
+ui.createNetwork.addEventListener(
     "click",
-    generateRandomNetwork
+    createNetwork
 );
 
-startBtn.addEventListener("click", startSimulation);
+// Случайная сеть.
+ui.randomNetwork.addEventListener(
+    "click",
+    randomNetwork
+);
 
-resetBtn.addEventListener("click", resetSimulation);
+// Начать поиск.
+ui.start.addEventListener(
+    "click",
+    startSimulation
+);
 
-prevBtn.addEventListener("click", () => {
-    setMessage(
-        "Пошаговая навигация станет доступна после подключения Go API."
+// Сбросить симуляцию.
+ui.reset.addEventListener("click", () => {
+    clearSimulation(
+        "Симуляция сброшена. Сеть и параметры сохранены."
     );
 });
 
-nextBtn.addEventListener("click", () => {
-    setMessage(
-        "Пошаговая навигация станет доступна после подключения Go API."
+// Шаг назад.
+ui.prev.addEventListener("click", () => {
+    if (
+        state.lookup &&
+        state.stepIndex >= 0
+    ) {
+        state.stepIndex--;
+        renderSimulationStep();
+    }
+});
+
+// Следующий шаг.
+ui.next.addEventListener("click", () => {
+    if (
+        state.lookup &&
+        state.stepIndex < state.lookup.steps.length - 1
+    ) {
+        state.stepIndex++;
+        renderSimulationStep();
+    }
+});
+
+// Смена алгоритма.
+ui.algorithm.addEventListener("change", () => {
+    clearSimulation(
+        "Алгоритм изменён. Начните новый поиск."
     );
 });
 
-algorithmSelect.addEventListener("change", () => {
-    updateRoutingPlaceholder();
-    renderNetwork();
+// Изменение стартового узла.
+ui.startNode.addEventListener("input", () => {
+    clearSimulation(
+        "Начальный узел изменён. Начните новый поиск."
+    );
 });
 
-startNodeInput.addEventListener("input", renderNetwork);
-targetIdInput.addEventListener("input", renderNetwork);
+// Изменение целевого ID.
+ui.targetId.addEventListener("input", () => {
+    clearSimulation(
+        "Целевой ID изменён. Начните новый поиск."
+    );
+});
+
+// Изменение списка узлов.
+ui.nodeIds.addEventListener("input", () => {
+    clearSimulation(
+        "Список ID изменён. " +
+        "Нажмите «Создать сеть» или «Начать»."
+    );
+});
 
 // --------------------------------------------------
-// Инициализация
+// Инициализация приложения
 // --------------------------------------------------
 
 try {
-    nodes = parseNodeIds(nodeIdsInput.value);
+    state.nodes = parseNodeIds(ui.nodeIds.value);
 } catch {
-    nodes = [...DEFAULT_NODES];
-    nodeIdsInput.value = nodes.join(", ");
+    state.nodes = [...DEFAULT_NODES];
+    ui.nodeIds.value = DEFAULT_NODES.join(", ");
 }
 
-clearSimulationResults();
-updateRoutingPlaceholder();
-renderNetwork();
-
-setMessage(
-    "Сеть подготовлена. Выберите алгоритм и параметры поиска.",
-    "Поиск ещё не выполнялся."
-);
+clearSimulation();

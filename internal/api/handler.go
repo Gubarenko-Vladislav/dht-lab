@@ -10,6 +10,7 @@ func NewHandler() http.Handler {
 
 	mux.HandleFunc("/health", healthHandler)
 	mux.Handle("/", http.FileServer(http.Dir("web")))
+	mux.HandleFunc("POST /api/lookup", lookupHandler)
 
 	return mux
 }
