@@ -24,7 +24,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("DHT Lab listening at http://%s", addr)
+	log.Printf("DHT Lab listening at http://%s", ":"+port)
 
 	log.Fatal(server.ListenAndServe())
 }
